@@ -151,7 +151,7 @@ def pairwise_align(
     # Calculate gene expression dissimilarity
     # Compute PURE gene expression cosine distance (beta=0, no one_hot)
     # Cell-type penalty is added separately via M_celltype for clean separation.
-    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, beta = 0, overwrite=overwrite)
+    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, overwrite=overwrite)
 
     # ── Soft cell-type dissimilarity via prototype gene expression ──────
     # Instead of a hard binary (0/1) penalty, we compute the cosine distance
