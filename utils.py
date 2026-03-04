@@ -77,18 +77,13 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
     if loss_fun == 'kl_loss':
         armijo = True  # there is no closed form line-search with KL
 
-    # Pre-compute the total linear cost for the Gromov line search.
-    # This is (1-alpha)*(M1 + gamma*M2), the full linear part of the FGW objective.
-    # Must be defined before the line_search closure that captures it.
-    M_linear = (1 - alpha) * M1 + gamma * (1 - alpha) * M2
-
     if armijo:
         def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
             return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
         # we are using this line search
         def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
-            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=M_linear, reg=alpha, nx=nx, **kwargs)
+            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
     
     module_path = inspect.getfile(ot)
 
@@ -99,8 +94,8 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
     # print(f"Module directory: {module_directory}")
 
     if log:
-
-        res, log = cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, M_linear=M_linear, **kwargs)
+   
+        res, log = cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
 
         fgw_dist = log['loss'][-1]
 
@@ -110,7 +105,7 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
         return res, log
 
     else:
-        return cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, M_linear=M_linear, **kwargs)
+        return cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
 
 
 def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
@@ -339,13 +334,14 @@ def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solv
         # to not change G0 in place.
         G = nx.copy(G0)
 
-    # Extract M_linear from kwargs for line search (computed in fused_gromov_wasserstein_incent)
-    M_linear = kwargs.pop('M_linear', M1 + gamma * M2)
-
     def cost(G):
-        # M1 and M2 are already pre-scaled by (1-alpha) in the caller.
-        # No extra (1-alpha) wrapper needed here.
-        return nx.sum(M1 * G) + gamma * nx.sum(M2 * G) + reg1 * f(G)
+        alpha = reg1
+        
+        # with niche aware
+        return (1-alpha) * (nx.sum(M1 * G) + gamma * nx.sum(M2 * G)) + alpha * f(G)
+
+        # without niche aware
+        # return (1-alpha) * (nx.sum(M1 * G)) + alpha * f(G)
 
     
 
