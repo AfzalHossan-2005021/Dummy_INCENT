@@ -59,18 +59,14 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
         if use_gpu:
             G0 = G0.cuda()
 
-    # Cast all matrices to match G0's dtype/device to prevent float vs double
-    # mismatches when torch.matmul is called (e.g. on GPU with float32 G).
-    if hasattr(G0, 'to'):  # PyTorch tensor
-        _dtype, _device = G0.dtype, G0.device
-        C1 = C1.to(dtype=_dtype, device=_device)
-        C2 = C2.to(dtype=_dtype, device=_device)
-        M1 = M1.to(dtype=_dtype, device=_device)
-        M2 = M2.to(dtype=_dtype, device=_device)
-        p  = p.to(dtype=_dtype, device=_device)
-        q  = q.to(dtype=_dtype, device=_device)
-
     def f(G):
+   
+        # print("G.shape: ", G.shape)
+        # print("C1.shape: ", C1.shape)
+        # print("C2.shape: ", C2.shape)
+        # print("G", G)
+        # print("C1", C1)
+        # print("C2", C2)
         return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
 
     def df(G):
@@ -81,13 +77,18 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
     if loss_fun == 'kl_loss':
         armijo = True  # there is no closed form line-search with KL
 
+    # Pre-compute the total linear cost for the Gromov line search.
+    # This is (1-alpha)*(M1 + gamma*M2), the full linear part of the FGW objective.
+    # Must be defined before the line_search closure that captures it.
+    M_linear = (1 - alpha) * M1 + gamma * (1 - alpha) * M2
+
     if armijo:
         def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
             return ot.optim.line_search_armijo(cost, G, deltaG, Mi, cost_G, nx=nx, **kwargs)
     else:
         # we are using this line search
         def line_search(cost, G, deltaG, Mi, cost_G, **kwargs):
-            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=0., reg=1., nx=nx, **kwargs)
+            return solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M=M_linear, reg=alpha, nx=nx, **kwargs)
     
     module_path = inspect.getfile(ot)
 
@@ -98,8 +99,8 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
     # print(f"Module directory: {module_directory}")
 
     if log:
-   
-        res, log = cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
+
+        res, log = cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, M_linear=M_linear, **kwargs)
 
         fgw_dist = log['loss'][-1]
 
@@ -109,7 +110,7 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
         return res, log
 
     else:
-        return cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, **kwargs)
+        return cg_incent(p, q, (1 - alpha) * M1, (1 - alpha) * M2, alpha, f, df, gamma = gamma, G0 = G0, line_search = line_search, log=True, numItermax=numItermax, stopThr=tol_rel, stopThr2=tol_abs, M_linear=M_linear, **kwargs)
 
 
 def solve_gromov_linesearch(G, deltaG, cost_G, C1, C2, M, reg,
@@ -338,14 +339,13 @@ def generic_conditional_gradient_incent(a, b, M1, M2, f, df, reg1, reg2, lp_solv
         # to not change G0 in place.
         G = nx.copy(G0)
 
-    def cost(G):
-        alpha = reg1
-        
-        # with niche aware
-        return (1-alpha) * (nx.sum(M1 * G) + gamma * nx.sum(M2 * G)) + alpha * f(G)
+    # Extract M_linear from kwargs for line search (computed in fused_gromov_wasserstein_incent)
+    M_linear = kwargs.pop('M_linear', M1 + gamma * M2)
 
-        # without niche aware
-        # return (1-alpha) * (nx.sum(M1 * G)) + alpha * f(G)
+    def cost(G):
+        # M1 and M2 are already pre-scaled by (1-alpha) in the caller.
+        # No extra (1-alpha) wrapper needed here.
+        return nx.sum(M1 * G) + gamma * nx.sum(M2 * G) + reg1 * f(G)
 
     
 
