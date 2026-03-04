@@ -141,7 +141,7 @@ def pairwise_align(
 
     # Calculate gene expression dissimilarity
     # filePath = '/content/drive/MyDrive/Thesis_data_anup/local_data'
-    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, beta = beta, overwrite=overwrite)
+    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, overwrite=overwrite)
 
     # ── Explicit cell-type mismatch penalty ──────────────────────────────
     # Binary matrix: 0 for same type, 1 for different type.
