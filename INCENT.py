@@ -648,6 +648,359 @@ def pairwise_align(
     return pi
 
 
+def pairwise_align_stratified(
+    sliceA: AnnData,
+    sliceB: AnnData,
+    alpha: float,
+    beta: float,
+    gamma: float,
+    radius: float,
+    filePath: str,
+    use_rep: Optional[str] = None,
+    G_init = None,
+    a_distribution = None,
+    b_distribution = None,
+    norm: bool = False,
+    numItermax: int = 6000,
+    backend = ot.backend.NumpyBackend(),
+    use_gpu: bool = False,
+    return_obj: bool = False,
+    verbose: bool = False,
+    gpu_verbose: bool = True,
+    sliceA_name: Optional[str] = None,
+    sliceB_name: Optional[str] = None,
+    overwrite = True,
+    neighborhood_dissimilarity: str = 'jsd',
+    **kwargs
+) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
+    """
+    Type-stratified Fused Gromov-Wasserstein alignment.
+
+    Decomposes the problem into K independent per-cell-type subproblems,
+    guaranteeing 100% cell-type correspondence by mathematical construction.
+
+    Biological basis (publication-grade):
+      • Cell identity is invariant across serial tissue sections — a neuron
+        does not become an oligodendrocyte.
+      • Each cell type has independent population dynamics (proliferation,
+        apoptosis, migration).  Per-type imbalance is absorbed by type-specific
+        dummy cells (birth/death).
+      • JSD neighborhood distributions are pre-computed on the FULL tissue
+        (all types in the radius), so within-type matching still captures
+        cross-type microenvironment structure.
+
+    For each cell type k, solves:
+        min_G  (1-α)<M1_k, G> + γ(1-α)<M2_k, G> + α·f_k(G)
+    where:
+        M1_k = cosine_gene_expr[S_k, T_k]  (pure gene expression, β=0)
+        M2_k = JSD[S_k, T_k]               (cellular neighborhood)
+        f_k(G) = Gromov spatial term within type k
+
+    Args:
+        Same as pairwise_align.  beta is accepted for API compatibility
+        but has no effect (all pairs are same-type → M_celltype ≡ 0).
+
+    Returns:
+        Same as pairwise_align.
+    """
+
+    start_time = time.time()
+
+    if not os.path.exists(filePath):
+        os.makedirs(filePath)
+
+    logFile = open(f"{filePath}/log.txt", "w")
+    logFile.write(f"pairwise_align_STRATIFIED\n")
+    logFile.write(f"{datetime.datetime.now()}\n")
+    logFile.write(f"sliceA: {sliceA_name}, sliceB: {sliceB_name}\n")
+    logFile.write(f"alpha={alpha}, gamma={gamma}, radius={radius}\n")
+    logFile.write(f"NOTE: beta={beta} ignored (type-stratified → all same-type)\n\n")
+
+    # ─── GPU / backend setup ───────────────────────────────────────────
+    if use_gpu:
+        if isinstance(backend, ot.backend.TorchBackend):
+            if torch.cuda.is_available():
+                if gpu_verbose:
+                    print("gpu is available, using gpu.")
+            else:
+                if gpu_verbose:
+                    print("gpu is not available, resorting to cpu.")
+                use_gpu = False
+        else:
+            print("GPU only supported with TorchBackend. Using cpu.")
+            use_gpu = False
+    else:
+        if gpu_verbose:
+            print("Using cpu.")
+
+    if not torch.cuda.is_available():
+        use_gpu = False
+
+    nx = backend
+
+    # Validate
+    for s in [sliceA, sliceB]:
+        if not len(s):
+            raise ValueError(f"Empty AnnData: {s}")
+
+    ns, nt = sliceA.shape[0], sliceB.shape[0]
+    labels_A = np.asarray(sliceA.obs['cell_type_annot'].values)
+    labels_B = np.asarray(sliceB.obs['cell_type_annot'].values)
+    all_types = sorted(set(labels_A) | set(labels_B))
+    K = len(all_types)
+
+    print(f"[STRATIFIED] {K} cell types, ns={ns}, nt={nt}")
+    logFile.write(f"n_types={K}, ns={ns}, nt={nt}\n")
+    logFile.write(f"types: {all_types}\n\n")
+
+    # ─── 1. Pre-compute FULL cost matrices (once) ─────────────────────
+    # 1a. Spatial distances (as numpy for sub-indexing)
+    coordinatesA = sliceA.obsm['spatial'].copy()
+    coordinatesB = sliceB.obsm['spatial'].copy()
+    D_A_full = euclidean_distances(coordinatesA, coordinatesA).astype(np.float64)
+    D_B_full = euclidean_distances(coordinatesB, coordinatesB).astype(np.float64)
+
+    # 1b. Gene expression cosine distance (ns × nt)
+    cosine_dist_gene = cosine_distance(
+        sliceA, sliceB, sliceA_name, sliceB_name, filePath,
+        use_rep=use_rep, use_gpu=use_gpu, nx=nx, overwrite=overwrite
+    )
+
+    # 1c. Neighborhood distributions
+    print("Computing neighborhood distributions for slice A...")
+    nd_A = neighborhood_distribution(sliceA, radius=radius)
+    nd_A = nd_A + 0.01  # smoothing to avoid zero division
+
+    print("Computing neighborhood distributions for slice B...")
+    nd_B = neighborhood_distribution(sliceB, radius=radius)
+    nd_B = nd_B + 0.01
+
+    # 1d. Neighborhood dissimilarity (ns × nt)
+    if neighborhood_dissimilarity == 'jsd':
+        print("Computing JSD of neighborhood distributions...")
+        if use_gpu and torch.cuda.is_available():
+            nd_A_t = torch.from_numpy(np.asarray(nd_A, dtype=np.float32)).cuda()
+            nd_B_t = torch.from_numpy(np.asarray(nd_B, dtype=np.float32)).cuda()
+            neighbor_dist_full = jensenshannon_divergence_backend(nd_A_t, nd_B_t)
+            if isinstance(neighbor_dist_full, torch.Tensor):
+                neighbor_dist_full = neighbor_dist_full.detach().cpu().numpy()
+        else:
+            neighbor_dist_full = jensenshannon_divergence_backend(nd_A, nd_B)
+            if isinstance(neighbor_dist_full, torch.Tensor):
+                neighbor_dist_full = neighbor_dist_full.detach().cpu().numpy()
+        neighbor_dist_full = np.asarray(neighbor_dist_full, dtype=np.float64)
+    elif neighborhood_dissimilarity == 'cosine':
+        ndA = np.asarray(nd_A, dtype=np.float64)
+        ndB = np.asarray(nd_B, dtype=np.float64)
+        numerator = ndA @ ndB.T
+        denom = np.linalg.norm(ndA, axis=1)[:, None] * np.linalg.norm(ndB, axis=1)[None, :]
+        denom[denom == 0] = 1.0
+        neighbor_dist_full = 1.0 - numerator / denom
+    elif neighborhood_dissimilarity == 'msd':
+        neighbor_dist_full = pairwise_msd(np.asarray(nd_A), np.asarray(nd_B))
+    else:
+        raise ValueError(f"Invalid neighborhood_dissimilarity: {neighborhood_dissimilarity!r}")
+
+    logFile.write(f"[pre-compute] cosine_gene shape={cosine_dist_gene.shape}, "
+                  f"neighbor_dist shape={neighbor_dist_full.shape}\n\n")
+
+    # ─── 2. Initial objectives (uniform baseline) ─────────────────────
+    G_uniform = np.ones((ns, nt), dtype=np.float64) / (ns * nt)
+    initial_obj_neighbor = float(np.sum(neighbor_dist_full * G_uniform))
+    initial_obj_gene = float(np.sum(cosine_dist_gene * G_uniform))
+
+    logFile.write(f"Initial objective neighbor ({neighborhood_dissimilarity}): {initial_obj_neighbor}\n")
+    logFile.write(f"Initial objective gene (cosine): {initial_obj_gene}\n\n")
+
+    # ─── 3. Per-type FGW ──────────────────────────────────────────────
+    pi_global = np.zeros((ns, nt), dtype=np.float64)
+
+    print(f"\n--- Solving {K} per-type FGW sub-problems ---")
+    for k_idx, k in enumerate(all_types):
+        S_k = np.where(labels_A == k)[0]
+        T_k = np.where(labels_B == k)[0]
+        n_sk, n_tk = len(S_k), len(T_k)
+
+        if n_sk == 0 or n_tk == 0:
+            logFile.write(f"[{k}] src={n_sk}, tgt={n_tk} — SKIPPED (no pairs)\n")
+            print(f"  [{k_idx+1}/{K}] {k}: src={n_sk}, tgt={n_tk} — skipped")
+            continue
+
+        budget_k = max(n_sk, n_tk)
+        w_ds_k = budget_k - n_sk   # dummy source weight (birth)
+        w_dt_k = budget_k - n_tk   # dummy target weight (death)
+        has_ds = w_ds_k > 0
+        has_dt = w_dt_k > 0
+        # NOTE: at most one of has_ds, has_dt is True since budget=max(n_sk,n_tk)
+
+        ns_aug = n_sk + (1 if has_ds else 0)
+        nt_aug = n_tk + (1 if has_dt else 0)
+
+        # ── Sub-index cost matrices ──
+        M1_k = cosine_dist_gene[np.ix_(S_k, T_k)].astype(np.float64)
+        M2_k = neighbor_dist_full[np.ix_(S_k, T_k)].astype(np.float64)
+        DA_k = D_A_full[np.ix_(S_k, S_k)].astype(np.float64)
+        DB_k = D_B_full[np.ix_(T_k, T_k)].astype(np.float64)
+
+        # Normalize spatial distances if requested (per-type)
+        if norm:
+            da_pos = DA_k[DA_k > 0]
+            if len(da_pos) > 0:
+                DA_k = DA_k / da_pos.min()
+            db_pos = DB_k[DB_k > 0]
+            if len(db_pos) > 0:
+                DB_k = DB_k / db_pos.min()
+
+        # ── Augment D_A (dummy spatial dist = 0) ──
+        if has_ds:
+            DA_aug = np.zeros((ns_aug, ns_aug), dtype=np.float64)
+            DA_aug[:n_sk, :n_sk] = DA_k
+        else:
+            DA_aug = DA_k.copy()
+
+        # ── Augment D_B (dummy spatial dist = 0) ──
+        if has_dt:
+            DB_aug = np.zeros((nt_aug, nt_aug), dtype=np.float64)
+            DB_aug[:n_tk, :n_tk] = DB_k
+        else:
+            DB_aug = DB_k.copy()
+
+        # ── Augment M1 (gene expr only, β=0 for same-type matching) ──
+        M1_aug = np.zeros((ns_aug, nt_aug), dtype=np.float64)
+        M1_aug[:n_sk, :n_tk] = M1_k
+        if has_dt:
+            M1_aug[:n_sk, n_tk] = M1_k.mean(axis=1)   # cost: real src → dummy tgt (death)
+        if has_ds:
+            M1_aug[n_sk, :n_tk] = M1_k.mean(axis=0)   # cost: dummy src → real tgt (birth)
+        if has_ds and has_dt:
+            M1_aug[n_sk, n_tk] = 0.0                   # dummy-to-dummy is free
+
+        # ── Augment M2 (JSD / neighborhood) ──
+        M2_aug = np.zeros((ns_aug, nt_aug), dtype=np.float64)
+        M2_aug[:n_sk, :n_tk] = M2_k
+        if has_dt:
+            M2_aug[:n_sk, n_tk] = M2_k.mean(axis=1)
+        if has_ds:
+            M2_aug[n_sk, :n_tk] = M2_k.mean(axis=0)
+        if has_ds and has_dt:
+            M2_aug[n_sk, n_tk] = 0.0
+
+        # ── Marginals ──
+        a_k = np.full(ns_aug, 1.0 / budget_k, dtype=np.float64)
+        if has_ds:
+            a_k[-1] = float(w_ds_k) / budget_k
+        b_k = np.full(nt_aug, 1.0 / budget_k, dtype=np.float64)
+        if has_dt:
+            b_k[-1] = float(w_dt_k) / budget_k
+
+        # ── G_init: outer product of marginals ──
+        # (uniform within type — no type bias needed since all same type)
+        G_init_k = np.outer(a_k, b_k)
+
+        # ── Convert to backend tensors ──
+        M1_t = nx.from_numpy(M1_aug)
+        M2_t = nx.from_numpy(M2_aug)
+        DA_t = nx.from_numpy(DA_aug)
+        DB_t = nx.from_numpy(DB_aug)
+        a_t = nx.from_numpy(a_k)
+        b_t = nx.from_numpy(b_k)
+        Gi_t = nx.from_numpy(G_init_k)
+
+        if isinstance(nx, ot.backend.TorchBackend):
+            M1_t = M1_t.float()
+            M2_t = M2_t.float()
+            DA_t = DA_t.float()
+            DB_t = DB_t.float()
+            Gi_t = Gi_t.float()
+            if use_gpu:
+                M1_t = M1_t.cuda()
+                M2_t = M2_t.cuda()
+                DA_t = DA_t.cuda()
+                DB_t = DB_t.cuda()
+                a_t = a_t.cuda()
+                b_t = b_t.cuda()
+                Gi_t = Gi_t.cuda()
+
+        # ── Solve FGW for this type ──
+        pi_k, logw_k = fused_gromov_wasserstein_incent(
+            M1_t, M2_t, DA_t, DB_t, a_t, b_t,
+            G_init=Gi_t, loss_fun='square_loss',
+            alpha=alpha, gamma=gamma, log=True,
+            numItermax=numItermax, verbose=verbose,
+            use_gpu=use_gpu, numItermaxEmd=500_000
+        )
+        pi_k = nx.to_numpy(pi_k)
+
+        # ── Strip dummy row/col, compute birth/death mass ──
+        if has_ds:
+            birth_k = float(pi_k[n_sk, :n_tk].sum())
+        else:
+            birth_k = 0.0
+
+        if has_dt:
+            death_k = float(pi_k[:n_sk, n_tk].sum())
+        else:
+            death_k = 0.0
+
+        # Extract real-to-real block
+        pi_k_real = pi_k[:n_sk, :n_tk]
+
+        # Renormalize so this type's sub-plan sums to 1
+        pk_sum = pi_k_real.sum()
+        if pk_sum > 0:
+            pi_k_real = pi_k_real / pk_sum
+
+        # ── Place into global pi with source-fraction weighting ──
+        # Weight = fraction of all source cells in this type
+        # This ensures: Σ_i pi_global[i, :] ≈ 1/ns for each source cell
+        weight_k = float(n_sk) / ns
+        pi_global[np.ix_(S_k, T_k)] = weight_k * pi_k_real
+
+        logFile.write(f"[{k}] src={n_sk}, tgt={n_tk}, budget={budget_k}, "
+                      f"birth={birth_k:.6f}, death={death_k:.6f}, "
+                      f"real_mass={pk_sum:.6f}, weight={weight_k:.4f}\n")
+        print(f"  [{k_idx+1}/{K}] {k}: {n_sk}→{n_tk} "
+              f"(budget={budget_k}) birth={birth_k:.4f} death={death_k:.4f}")
+
+    # ─── 4. Global renormalization ────────────────────────────────────
+    # pi_global.sum() should already ≈ 1.0 (= Σ_k n_sk/ns = ns/ns)
+    # but renormalize to handle edge cases (types with 0 cells on one side)
+    pi_sum = pi_global.sum()
+    if pi_sum > 0 and abs(pi_sum - 1.0) > 1e-10:
+        logFile.write(f"\n[assembly] pi_global.sum()={pi_sum:.8f}, renormalizing to 1.0\n")
+        pi_global = pi_global / pi_sum
+
+    print(f"\n[STRATIFIED] Assembled π: shape={pi_global.shape}, sum={pi_global.sum():.8f}")
+
+    # ─── 5. Final objectives ──────────────────────────────────────────
+    final_obj_neighbor = float(np.sum(neighbor_dist_full * pi_global))
+    final_obj_gene = float(np.sum(cosine_dist_gene * pi_global))
+
+    neighbor_impr = 100.0 * (initial_obj_neighbor - final_obj_neighbor) / initial_obj_neighbor
+    gene_impr = 100.0 * (initial_obj_gene - final_obj_gene) / initial_obj_gene
+
+    logFile.write(f"\nFinal objective neighbor ({neighborhood_dissimilarity}): {final_obj_neighbor}\n")
+    logFile.write(f"Final objective gene (cosine): {final_obj_gene}\n")
+    logFile.write(f"JSD improvement: {neighbor_impr:.4f}%\n")
+    logFile.write(f"Gene improvement: {gene_impr:.4f}%\n")
+    logFile.write(f"Runtime: {time.time() - start_time:.2f} seconds\n")
+    logFile.close()
+
+    print(f"[STRATIFIED] JSD: {initial_obj_neighbor:.6f} → {final_obj_neighbor:.6f} "
+          f"({neighbor_impr:.2f}% improvement)")
+    print(f"[STRATIFIED] Gene: {initial_obj_gene:.6f} → {final_obj_gene:.6f} "
+          f"({gene_impr:.2f}% improvement)")
+    print(f"[STRATIFIED] Runtime: {time.time() - start_time:.1f}s")
+
+    if isinstance(backend, ot.backend.TorchBackend) and use_gpu:
+        torch.cuda.empty_cache()
+
+    if return_obj:
+        return pi_global, initial_obj_neighbor, initial_obj_gene, final_obj_neighbor, final_obj_gene
+
+    return pi_global
+
+
 def neighborhood_distribution(curr_slice, radius):
     """
     This method is added by Anup Bhowmik
