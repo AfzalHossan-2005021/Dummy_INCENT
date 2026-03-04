@@ -59,14 +59,18 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
         if use_gpu:
             G0 = G0.cuda()
 
+    # Cast all matrices to match G0's dtype/device to prevent float vs double
+    # mismatches when torch.matmul is called (e.g. on GPU with float32 G).
+    if hasattr(G0, 'to'):  # PyTorch tensor
+        _dtype, _device = G0.dtype, G0.device
+        C1 = C1.to(dtype=_dtype, device=_device)
+        C2 = C2.to(dtype=_dtype, device=_device)
+        M1 = M1.to(dtype=_dtype, device=_device)
+        M2 = M2.to(dtype=_dtype, device=_device)
+        p  = p.to(dtype=_dtype, device=_device)
+        q  = q.to(dtype=_dtype, device=_device)
+
     def f(G):
-   
-        # print("G.shape: ", G.shape)
-        # print("C1.shape: ", C1.shape)
-        # print("C2.shape: ", C2.shape)
-        # print("G", G)
-        # print("C1", C1)
-        # print("C2", C2)
         return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
 
     def df(G):
