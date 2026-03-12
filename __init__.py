@@ -1,1 +1,1 @@
-from .INCENT import pairwise_align, pairwise_align_stratified, neighborhood_distribution, cosine_distance
+from .INCENT import pairwise_align, neighborhood_distribution, cosine_distance
