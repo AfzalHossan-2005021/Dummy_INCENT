@@ -4,6 +4,7 @@ import time
 import torch
 import datetime
 import numpy as np
+import pandas as pd
 
 from tqdm import tqdm
 from anndata import AnnData
@@ -35,7 +36,7 @@ def pairwise_align(
     gpu_verbose: bool = True, 
     sliceA_name: Optional[str] = None,
     sliceB_name: Optional[str] = None,
-    overwrite = True,
+    overwrite = False,
     neighborhood_dissimilarity: str='jsd',
     dummy_cell: bool = True,
     **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
@@ -125,7 +126,24 @@ def pairwise_align(
 
     
     # Backend
-    nx = backend    
+    nx = backend
+
+    # Filter to shared genes
+    shared_genes = sliceA.var_names.intersection(sliceB.var_names)
+    if len(shared_genes) == 0:
+        raise ValueError("No shared genes between the two slices.")
+    sliceA = sliceA[:, shared_genes]
+    sliceB = sliceB[:, shared_genes]
+
+
+    # Filter to shared cell types
+    # This is needed for the cell-type mismatch penalty, and also ensures that the neighborhood distributions are comparable (same set of cell types).
+    shared_cell_types = pd.Index(sliceA.obs['cell_type_annot']).unique().intersection(pd.Index(sliceB.obs['cell_type_annot']).unique())
+    if len(shared_cell_types) == 0:
+        raise ValueError("No shared cell types between the two slices.")
+    sliceA = sliceA[sliceA.obs['cell_type_annot'].isin(shared_cell_types)]
+    sliceB = sliceB[sliceB.obs['cell_type_annot'].isin(shared_cell_types)]
+
     
     # Calculate spatial distances
     coordinatesA = sliceA.obsm['spatial'].copy()
@@ -149,62 +167,18 @@ def pairwise_align(
 
 
     # Calculate gene expression dissimilarity
-    # Compute PURE gene expression cosine distance (beta=0, no one_hot)
-    # Cell-type penalty is added separately via M_celltype for clean separation.
-    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, overwrite=overwrite)
+    # filePath = '/content/drive/MyDrive/Thesis_data_anup/local_data'
+    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, beta = beta, overwrite=overwrite)
 
-    # ── Soft cell-type dissimilarity via prototype gene expression ──────
-    # Instead of a hard binary (0/1) penalty, we compute the cosine distance
-    # between cell-type *prototype* expression profiles (centroid of each type).
-    # Rationale (publication-grade):
-    #   • Transcriptomically similar types (e.g. exc-neuron subtypes) receive
-    #     a small penalty; very different types (neuron vs. glial) receive a
-    #     large penalty.
-    #   • This creates a SMOOTH optimization landscape, allowing the FW solver
-    #     to trade off cell-type fidelity against gene-expression / JSD quality.
-    #   • The penalty is normalised to [0, 1] so β directly controls the
-    #     maximum cell-type contribution.
-    from sklearn.metrics.pairwise import cosine_distances as _cosine_distances
+    # ── Explicit cell-type mismatch penalty ──────────────────────────────
+    # Binary matrix: 0 for same type, 1 for different type.
+    # Added to M1 so it enters the FW gradient directly → strong cell-type signal.
 
     _lab_A = np.asarray(sliceA.obs['cell_type_annot'].values)
     _lab_B = np.asarray(sliceB.obs['cell_type_annot'].values)
-    _all_types = sorted(set(_lab_A) | set(_lab_B))
-    _type2idx = {t: i for i, t in enumerate(_all_types)}
-    _n_types = len(_all_types)
-
-    # Extract raw gene expression (same features used for cosine_dist_gene_expr)
-    _expr_A = to_dense_array(extract_data_matrix(sliceA, use_rep)).astype(np.float64) + 0.01
-    _expr_B = to_dense_array(extract_data_matrix(sliceB, use_rep)).astype(np.float64) + 0.01
-
-    # Compute prototype (mean expression) per cell type across both slices
-    _proto = np.zeros((_n_types, _expr_A.shape[1]), dtype=np.float64)
-    for _k in _all_types:
-        _parts = []
-        _mask_A = (_lab_A == _k)
-        _mask_B = (_lab_B == _k)
-        if _mask_A.any():
-            _parts.append(_expr_A[_mask_A])
-        if _mask_B.any():
-            _parts.append(_expr_B[_mask_B])
-        _proto[_type2idx[_k]] = np.concatenate(_parts, axis=0).mean(axis=0)
-
-    # Type-to-type cosine distance → normalise to [0, 1]
-    _type_dist = _cosine_distances(_proto)   # (n_types, n_types)
-    _td_max = _type_dist.max()
-    if _td_max > 0:
-        _type_dist /= _td_max
-
-    # Build (ns, nt) soft M_celltype via fancy indexing
-    _idx_A = np.array([_type2idx[l] for l in _lab_A])
-    _idx_B = np.array([_type2idx[l] for l in _lab_B])
-    M_celltype = _type_dist[_idx_A][:, _idx_B]   # continuous [0, 1]
-
+    M_celltype = (_lab_A[:, None] != _lab_B[None, :]).astype(np.float64)
     M1_combined = (1 - beta) * cosine_dist_gene_expr + beta * M_celltype
-    logFile.write(f"[cell_type_soft] beta={beta}, n_types={_n_types}, "
-                  f"type_dist range=[{_type_dist.min():.4f}, {_type_dist.max():.4f}]\n")
-    logFile.write(f"[cost_scales] M_gene mean={cosine_dist_gene_expr.mean():.4f}, "
-                  f"M_celltype mean={M_celltype.mean():.4f}, "
-                  f"M1 mean={M1_combined.mean():.4f}\n")
+    logFile.write(f"[cell_type_penalty] beta={beta}, M_celltype shape={M_celltype.shape}\n")
 
 
     M1 = nx.from_numpy(M1_combined)
@@ -367,32 +341,50 @@ def pairwise_align(
             if isinstance(nx, ot.backend.TorchBackend):
                 D_B = D_B.float()
 
-        # ---- Augment M1: add dummy row/col only where needed ----
-        # Dummy cells represent unmatched (birth/death) – they have no cell
-        # type, so their cost should reflect pure gene expression mismatch,
-        # NOT the cell-type penalty.  Using cosine_dist_gene_expr keeps the
-        # dummy cost calibrated to the actual transcriptomic landscape.
+        # ---- Precompute per-type max cost from the same-type submatrix ----
         M1_np = _to_np(M1)
+        M2_np = _to_np(M2)
+        _type_M1_max = {}
+        _type_M2_max = {}
+        for _type_k in all_types:
+            _S = np.where(_lab_A == _type_k)[0]
+            _T = np.where(_lab_B == _type_k)[0]
+            if len(_S) > 0 and len(_T) > 0:
+                _type_M1_max[_type_k] = float(M1_np[np.ix_(_S, _T)].max())
+                _type_M2_max[_type_k] = float(M2_np[np.ix_(_S, _T)].max())
+            else:
+                # Type absent on one side — fall back to global max
+                _type_M1_max[_type_k] = float(M1_np.max())
+                _type_M2_max[_type_k] = float(M2_np.max())
+
+        # Per-cell dummy costs: each cell pays the max of its own type's submatrix
+        _death_M1 = np.array([_type_M1_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
+        _birth_M1 = np.array([_type_M1_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
+        _death_M2 = np.array([_type_M2_max[_lab_A[i]] for i in range(ns)], dtype=np.float64)
+        _birth_M2 = np.array([_type_M2_max[_lab_B[j]] for j in range(nt)], dtype=np.float64)
+
+        epsilon = 1e-6
+
+        # ---- Augment M1: add dummy row/col only where needed ----
         M1_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M1_aug[:ns, :nt] = M1_np
         if _has_dummy_tgt:
-            M1_aug[:ns, nt] = cosine_dist_gene_expr.mean(axis=1)
+            M1_aug[:ns, nt] = _death_M1 + epsilon   # src cell i → dummy tgt: max within i's type
         if _has_dummy_src:
-            M1_aug[ns, :nt] = cosine_dist_gene_expr.mean(axis=0)
+            M1_aug[ns, :nt] = _birth_M1 + epsilon   # dummy src → tgt cell j: max within j's type
         if _has_dummy_src and _has_dummy_tgt:
-            M1_aug[ns, nt] = 0.0  # dummy-to-dummy is free
+            M1_aug[ns, nt] = np.max(M1_np) + epsilon          # dummy-to-dummy is free
         M1 = nx.from_numpy(M1_aug)
 
         # ---- Augment M2: add dummy row/col only where needed ----
-        M2_np = _to_np(M2)
         M2_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
         M2_aug[:ns, :nt] = M2_np
         if _has_dummy_tgt:
-            M2_aug[:ns, nt] = M2_np.mean(axis=1)
+            M2_aug[:ns, nt] = _death_M2 + epsilon   # src cell i → dummy tgt: max within i's type
         if _has_dummy_src:
-            M2_aug[ns, :nt] = M2_np.mean(axis=0)
+            M2_aug[ns, :nt] = _birth_M2 + epsilon   # dummy src → tgt cell j: max within j's type
         if _has_dummy_src and _has_dummy_tgt:
-            M2_aug[ns, nt] = 0.0
+            M2_aug[ns, nt] = np.max(M2_np) + epsilon          # dummy-to-dummy is free
         M2 = nx.from_numpy(M2_aug)
 
         logFile.write(f"[dummy_cell] Augmented: D_A {tuple(D_A.shape)}, D_B {tuple(D_B.shape)}, "
@@ -447,97 +439,14 @@ def pairwise_align(
         D_A /= nx.min(D_A[D_A>0])
         D_B /= nx.min(D_B[D_B>0])
     
-    # ── Cell-type-aware warm start ────────────────────────────────────────
-    # If no user-provided G_init, create one that concentrates mass on
-    # same-type pairs.  Crucially, G_init must SATISFY the augmented
-    # marginals (a, b) so the FW solver starts inside the constraint set.
-    #
-    # Strategy: start from the outer product a ⊗ b (which trivially satisfies
-    # marginals), then upweight same-type entries and downweight cross-type
-    # entries while preserving marginals via iterative Sinkhorn projection.
-    if G_init is None:
-        if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
-            # Marginals
-            a_np = np.array([1.0/_budget]*ns + ([float(_w_dummy_src)/_budget] if _has_dummy_src else []), dtype=np.float64)
-            b_np = np.array([1.0/_budget]*nt + ([float(_w_dummy_tgt)/_budget] if _has_dummy_tgt else []), dtype=np.float64)
-
-            # Start from outer product (satisfies marginals by construction)
-            _G_init = np.outer(a_np, b_np)
-
-            # Build same-type mask for real block
-            _same_type = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
-            for _k in set(_lab_A) | set(_lab_B):
-                _src = np.where(_lab_A == _k)[0]
-                _tgt = np.where(_lab_B == _k)[0]
-                if len(_src) > 0 and len(_tgt) > 0:
-                    _same_type[np.ix_(_src, _tgt)] = 1.0
-            # Dummy entries: leave at 0 (neutral)
-
-            # Upweight same-type by factor K, leave others at 1
-            _K = 10.0  # concentration factor
-            _weights = np.ones((_ns_aug, _nt_aug), dtype=np.float64)
-            _weights += (_K - 1.0) * _same_type  # same-type entries get weight K
-
-            _G_init = _G_init * _weights
-
-            # Sinkhorn projection to restore marginals
-            for _sinkhorn_it in range(200):
-                # Row normalization
-                _rs = _G_init.sum(axis=1, keepdims=True)
-                _rs[_rs == 0] = 1.0
-                _G_init = _G_init * (a_np[:, None] / _rs)
-                # Column normalization
-                _cs = _G_init.sum(axis=0, keepdims=True)
-                _cs[_cs == 0] = 1.0
-                _G_init = _G_init * (b_np[None, :] / _cs)
-
-            # Verify marginals
-            _marginal_err = max(
-                np.abs(_G_init.sum(axis=1) - a_np).max(),
-                np.abs(_G_init.sum(axis=0) - b_np).max()
-            )
-            logFile.write(f"[G_init] augmented warm start, shape={_G_init.shape}, "
-                          f"sum={_G_init.sum():.6f}, marginal_err={_marginal_err:.2e}\n")
-            print(f"[G_init] Cell-type-aware warm start (augmented), marginal_err={_marginal_err:.2e}")
-            G_init = _G_init
-        else:
-            # Non-dummy: standard cell-type-aware init on real dims
-            ns_real, nt_real = sliceA.shape[0], sliceB.shape[0]
-            a_np = np.ones(ns_real, dtype=np.float64) / ns_real
-            b_np = np.ones(nt_real, dtype=np.float64) / nt_real
-            _G_init = np.outer(a_np, b_np)
-
-            _same_type = np.zeros((ns_real, nt_real), dtype=np.float64)
-            for _k in set(_lab_A) | set(_lab_B):
-                _src = np.where(_lab_A == _k)[0]
-                _tgt = np.where(_lab_B == _k)[0]
-                if len(_src) > 0 and len(_tgt) > 0:
-                    _same_type[np.ix_(_src, _tgt)] = 1.0
-
-            _K = 10.0
-            _G_init = _G_init * (1.0 + (_K - 1.0) * _same_type)
-            for _sinkhorn_it in range(200):
-                _rs = _G_init.sum(axis=1, keepdims=True)
-                _rs[_rs == 0] = 1.0
-                _G_init = _G_init * (a_np[:, None] / _rs)
-                _cs = _G_init.sum(axis=0, keepdims=True)
-                _cs[_cs == 0] = 1.0
-                _G_init = _G_init * (b_np[None, :] / _cs)
-
-            G_init = _G_init
-            logFile.write(f"[G_init] cell-type-aware warm start, shape={_G_init.shape}\n")
-            print("[G_init] Using cell-type-aware warm start")
-
     # Run OT
     if G_init is not None:
         if dummy_cell and (_has_dummy_src or _has_dummy_tgt):
+            # Pad user-provided (ns x nt) G_init to augmented dims
             _gi = np.array(G_init, dtype=np.float64)
-            if _gi.shape != (_ns_aug, _nt_aug):
-                # Pad user-provided (ns x nt) G_init to augmented dims
-                _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
-                _gi_aug[:ns, :nt] = _gi
-                G_init = _gi_aug
-            # else: already augmented (from our cell-type-aware init)
+            _gi_aug = np.zeros((_ns_aug, _nt_aug), dtype=np.float64)
+            _gi_aug[:ns, :nt] = _gi
+            G_init = _gi_aug
         G_init = nx.from_numpy(G_init)
         if isinstance(nx,ot.backend.TorchBackend):
             G_init = G_init.float()
@@ -608,15 +517,26 @@ def pairwise_align(
         print(f"[dummy_cell] death_mass: {death_mass:.6f}, birth_mass: {birth_mass:.6f}, "
               f"real_to_real_mass: {pi_sum:.6f} (renormalized to 1.0)")
 
-    # ── Final objective: use FULL inner product <cost, pi>, consistent
-    #    with the initial objective formula.  Previous code used argmax-
-    #    based partial sum which was NOT comparable to the initial. ────
     if neighborhood_dissimilarity == 'jsd':
-        final_obj_neighbor = np.sum(js_dist_neighborhood * pi)
+        max_indices = np.argmax(pi, axis=1)
+        # multiply each value of max_indices from pi_mat with the corresponding js_dist entry
+        jsd_error = np.zeros(max_indices.shape)
+        for i in range(len(max_indices)):
+            jsd_error[i] = pi[i][max_indices[i]] * js_dist_neighborhood[i][max_indices[i]]
+
+        final_obj_neighbor = np.sum(jsd_error)
     elif neighborhood_dissimilarity == 'msd':
-        final_obj_neighbor = np.sum(msd_neighborhood * pi)
+        final_obj_neighbor = np.sum(msd_neighborhood*pi)
+
     elif neighborhood_dissimilarity == 'cosine':
-        final_obj_neighbor = np.sum(cosine_dist_neighborhood * pi)
+        max_indices = np.argmax(pi, axis=1)
+        # multiply each value of max_indices from pi_mat with the corresponding js_dist entry
+        cos_error = np.zeros(max_indices.shape)
+        for i in range(len(max_indices)):
+            cos_error[i] = pi[i][max_indices[i]] * cosine_dist_neighborhood[i][max_indices[i]]
+
+        final_obj_neighbor = np.sum(cos_error)
+
 
     final_obj_gene = np.sum(cosine_dist_gene_expr * pi)
 
@@ -646,359 +566,6 @@ def pairwise_align(
         return pi, initial_obj_neighbor, initial_obj_gene, final_obj_neighbor, final_obj_gene
     
     return pi
-
-
-def pairwise_align_stratified(
-    sliceA: AnnData,
-    sliceB: AnnData,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    radius: float,
-    filePath: str,
-    use_rep: Optional[str] = None,
-    G_init = None,
-    a_distribution = None,
-    b_distribution = None,
-    norm: bool = False,
-    numItermax: int = 6000,
-    backend = ot.backend.NumpyBackend(),
-    use_gpu: bool = False,
-    return_obj: bool = False,
-    verbose: bool = False,
-    gpu_verbose: bool = True,
-    sliceA_name: Optional[str] = None,
-    sliceB_name: Optional[str] = None,
-    overwrite = True,
-    neighborhood_dissimilarity: str = 'jsd',
-    **kwargs
-) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
-    """
-    Type-stratified Fused Gromov-Wasserstein alignment.
-
-    Decomposes the problem into K independent per-cell-type subproblems,
-    guaranteeing 100% cell-type correspondence by mathematical construction.
-
-    Biological basis (publication-grade):
-      • Cell identity is invariant across serial tissue sections — a neuron
-        does not become an oligodendrocyte.
-      • Each cell type has independent population dynamics (proliferation,
-        apoptosis, migration).  Per-type imbalance is absorbed by type-specific
-        dummy cells (birth/death).
-      • JSD neighborhood distributions are pre-computed on the FULL tissue
-        (all types in the radius), so within-type matching still captures
-        cross-type microenvironment structure.
-
-    For each cell type k, solves:
-        min_G  (1-α)<M1_k, G> + γ(1-α)<M2_k, G> + α·f_k(G)
-    where:
-        M1_k = cosine_gene_expr[S_k, T_k]  (pure gene expression, β=0)
-        M2_k = JSD[S_k, T_k]               (cellular neighborhood)
-        f_k(G) = Gromov spatial term within type k
-
-    Args:
-        Same as pairwise_align.  beta is accepted for API compatibility
-        but has no effect (all pairs are same-type → M_celltype ≡ 0).
-
-    Returns:
-        Same as pairwise_align.
-    """
-
-    start_time = time.time()
-
-    if not os.path.exists(filePath):
-        os.makedirs(filePath)
-
-    logFile = open(f"{filePath}/log.txt", "w")
-    logFile.write(f"pairwise_align_STRATIFIED\n")
-    logFile.write(f"{datetime.datetime.now()}\n")
-    logFile.write(f"sliceA: {sliceA_name}, sliceB: {sliceB_name}\n")
-    logFile.write(f"alpha={alpha}, gamma={gamma}, radius={radius}\n")
-    logFile.write(f"NOTE: beta={beta} ignored (type-stratified → all same-type)\n\n")
-
-    # ─── GPU / backend setup ───────────────────────────────────────────
-    if use_gpu:
-        if isinstance(backend, ot.backend.TorchBackend):
-            if torch.cuda.is_available():
-                if gpu_verbose:
-                    print("gpu is available, using gpu.")
-            else:
-                if gpu_verbose:
-                    print("gpu is not available, resorting to cpu.")
-                use_gpu = False
-        else:
-            print("GPU only supported with TorchBackend. Using cpu.")
-            use_gpu = False
-    else:
-        if gpu_verbose:
-            print("Using cpu.")
-
-    if not torch.cuda.is_available():
-        use_gpu = False
-
-    nx = backend
-
-    # Validate
-    for s in [sliceA, sliceB]:
-        if not len(s):
-            raise ValueError(f"Empty AnnData: {s}")
-
-    ns, nt = sliceA.shape[0], sliceB.shape[0]
-    labels_A = np.asarray(sliceA.obs['cell_type_annot'].values)
-    labels_B = np.asarray(sliceB.obs['cell_type_annot'].values)
-    all_types = sorted(set(labels_A) | set(labels_B))
-    K = len(all_types)
-
-    print(f"[STRATIFIED] {K} cell types, ns={ns}, nt={nt}")
-    logFile.write(f"n_types={K}, ns={ns}, nt={nt}\n")
-    logFile.write(f"types: {all_types}\n\n")
-
-    # ─── 1. Pre-compute FULL cost matrices (once) ─────────────────────
-    # 1a. Spatial distances (as numpy for sub-indexing)
-    coordinatesA = sliceA.obsm['spatial'].copy()
-    coordinatesB = sliceB.obsm['spatial'].copy()
-    D_A_full = euclidean_distances(coordinatesA, coordinatesA).astype(np.float64)
-    D_B_full = euclidean_distances(coordinatesB, coordinatesB).astype(np.float64)
-
-    # 1b. Gene expression cosine distance (ns × nt)
-    cosine_dist_gene = cosine_distance(
-        sliceA, sliceB, sliceA_name, sliceB_name, filePath,
-        use_rep=use_rep, use_gpu=use_gpu, nx=nx, overwrite=overwrite
-    )
-
-    # 1c. Neighborhood distributions
-    print("Computing neighborhood distributions for slice A...")
-    nd_A = neighborhood_distribution(sliceA, radius=radius)
-    nd_A = nd_A + 0.01  # smoothing to avoid zero division
-
-    print("Computing neighborhood distributions for slice B...")
-    nd_B = neighborhood_distribution(sliceB, radius=radius)
-    nd_B = nd_B + 0.01
-
-    # 1d. Neighborhood dissimilarity (ns × nt)
-    if neighborhood_dissimilarity == 'jsd':
-        print("Computing JSD of neighborhood distributions...")
-        if use_gpu and torch.cuda.is_available():
-            nd_A_t = torch.from_numpy(np.asarray(nd_A, dtype=np.float32)).cuda()
-            nd_B_t = torch.from_numpy(np.asarray(nd_B, dtype=np.float32)).cuda()
-            neighbor_dist_full = jensenshannon_divergence_backend(nd_A_t, nd_B_t)
-            if isinstance(neighbor_dist_full, torch.Tensor):
-                neighbor_dist_full = neighbor_dist_full.detach().cpu().numpy()
-        else:
-            neighbor_dist_full = jensenshannon_divergence_backend(nd_A, nd_B)
-            if isinstance(neighbor_dist_full, torch.Tensor):
-                neighbor_dist_full = neighbor_dist_full.detach().cpu().numpy()
-        neighbor_dist_full = np.asarray(neighbor_dist_full, dtype=np.float64)
-    elif neighborhood_dissimilarity == 'cosine':
-        ndA = np.asarray(nd_A, dtype=np.float64)
-        ndB = np.asarray(nd_B, dtype=np.float64)
-        numerator = ndA @ ndB.T
-        denom = np.linalg.norm(ndA, axis=1)[:, None] * np.linalg.norm(ndB, axis=1)[None, :]
-        denom[denom == 0] = 1.0
-        neighbor_dist_full = 1.0 - numerator / denom
-    elif neighborhood_dissimilarity == 'msd':
-        neighbor_dist_full = pairwise_msd(np.asarray(nd_A), np.asarray(nd_B))
-    else:
-        raise ValueError(f"Invalid neighborhood_dissimilarity: {neighborhood_dissimilarity!r}")
-
-    logFile.write(f"[pre-compute] cosine_gene shape={cosine_dist_gene.shape}, "
-                  f"neighbor_dist shape={neighbor_dist_full.shape}\n\n")
-
-    # ─── 2. Initial objectives (uniform baseline) ─────────────────────
-    G_uniform = np.ones((ns, nt), dtype=np.float64) / (ns * nt)
-    initial_obj_neighbor = float(np.sum(neighbor_dist_full * G_uniform))
-    initial_obj_gene = float(np.sum(cosine_dist_gene * G_uniform))
-
-    logFile.write(f"Initial objective neighbor ({neighborhood_dissimilarity}): {initial_obj_neighbor}\n")
-    logFile.write(f"Initial objective gene (cosine): {initial_obj_gene}\n\n")
-
-    # ─── 3. Per-type FGW ──────────────────────────────────────────────
-    pi_global = np.zeros((ns, nt), dtype=np.float64)
-
-    print(f"\n--- Solving {K} per-type FGW sub-problems ---")
-    for k_idx, k in enumerate(all_types):
-        S_k = np.where(labels_A == k)[0]
-        T_k = np.where(labels_B == k)[0]
-        n_sk, n_tk = len(S_k), len(T_k)
-
-        if n_sk == 0 or n_tk == 0:
-            logFile.write(f"[{k}] src={n_sk}, tgt={n_tk} — SKIPPED (no pairs)\n")
-            print(f"  [{k_idx+1}/{K}] {k}: src={n_sk}, tgt={n_tk} — skipped")
-            continue
-
-        budget_k = max(n_sk, n_tk)
-        w_ds_k = budget_k - n_sk   # dummy source weight (birth)
-        w_dt_k = budget_k - n_tk   # dummy target weight (death)
-        has_ds = w_ds_k > 0
-        has_dt = w_dt_k > 0
-        # NOTE: at most one of has_ds, has_dt is True since budget=max(n_sk,n_tk)
-
-        ns_aug = n_sk + (1 if has_ds else 0)
-        nt_aug = n_tk + (1 if has_dt else 0)
-
-        # ── Sub-index cost matrices ──
-        M1_k = cosine_dist_gene[np.ix_(S_k, T_k)].astype(np.float64)
-        M2_k = neighbor_dist_full[np.ix_(S_k, T_k)].astype(np.float64)
-        DA_k = D_A_full[np.ix_(S_k, S_k)].astype(np.float64)
-        DB_k = D_B_full[np.ix_(T_k, T_k)].astype(np.float64)
-
-        # Normalize spatial distances if requested (per-type)
-        if norm:
-            da_pos = DA_k[DA_k > 0]
-            if len(da_pos) > 0:
-                DA_k = DA_k / da_pos.min()
-            db_pos = DB_k[DB_k > 0]
-            if len(db_pos) > 0:
-                DB_k = DB_k / db_pos.min()
-
-        # ── Augment D_A (dummy spatial dist = 0) ──
-        if has_ds:
-            DA_aug = np.zeros((ns_aug, ns_aug), dtype=np.float64)
-            DA_aug[:n_sk, :n_sk] = DA_k
-        else:
-            DA_aug = DA_k.copy()
-
-        # ── Augment D_B (dummy spatial dist = 0) ──
-        if has_dt:
-            DB_aug = np.zeros((nt_aug, nt_aug), dtype=np.float64)
-            DB_aug[:n_tk, :n_tk] = DB_k
-        else:
-            DB_aug = DB_k.copy()
-
-        # ── Augment M1 (gene expr only, β=0 for same-type matching) ──
-        M1_aug = np.zeros((ns_aug, nt_aug), dtype=np.float64)
-        M1_aug[:n_sk, :n_tk] = M1_k
-        if has_dt:
-            M1_aug[:n_sk, n_tk] = M1_k.mean(axis=1)   # cost: real src → dummy tgt (death)
-        if has_ds:
-            M1_aug[n_sk, :n_tk] = M1_k.mean(axis=0)   # cost: dummy src → real tgt (birth)
-        if has_ds and has_dt:
-            M1_aug[n_sk, n_tk] = 0.0                   # dummy-to-dummy is free
-
-        # ── Augment M2 (JSD / neighborhood) ──
-        M2_aug = np.zeros((ns_aug, nt_aug), dtype=np.float64)
-        M2_aug[:n_sk, :n_tk] = M2_k
-        if has_dt:
-            M2_aug[:n_sk, n_tk] = M2_k.mean(axis=1)
-        if has_ds:
-            M2_aug[n_sk, :n_tk] = M2_k.mean(axis=0)
-        if has_ds and has_dt:
-            M2_aug[n_sk, n_tk] = 0.0
-
-        # ── Marginals ──
-        a_k = np.full(ns_aug, 1.0 / budget_k, dtype=np.float64)
-        if has_ds:
-            a_k[-1] = float(w_ds_k) / budget_k
-        b_k = np.full(nt_aug, 1.0 / budget_k, dtype=np.float64)
-        if has_dt:
-            b_k[-1] = float(w_dt_k) / budget_k
-
-        # ── G_init: outer product of marginals ──
-        # (uniform within type — no type bias needed since all same type)
-        G_init_k = np.outer(a_k, b_k)
-
-        # ── Convert to backend tensors ──
-        M1_t = nx.from_numpy(M1_aug)
-        M2_t = nx.from_numpy(M2_aug)
-        DA_t = nx.from_numpy(DA_aug)
-        DB_t = nx.from_numpy(DB_aug)
-        a_t = nx.from_numpy(a_k)
-        b_t = nx.from_numpy(b_k)
-        Gi_t = nx.from_numpy(G_init_k)
-
-        if isinstance(nx, ot.backend.TorchBackend):
-            M1_t = M1_t.float()
-            M2_t = M2_t.float()
-            DA_t = DA_t.float()
-            DB_t = DB_t.float()
-            Gi_t = Gi_t.float()
-            if use_gpu:
-                M1_t = M1_t.cuda()
-                M2_t = M2_t.cuda()
-                DA_t = DA_t.cuda()
-                DB_t = DB_t.cuda()
-                a_t = a_t.cuda()
-                b_t = b_t.cuda()
-                Gi_t = Gi_t.cuda()
-
-        # ── Solve FGW for this type ──
-        pi_k, logw_k = fused_gromov_wasserstein_incent(
-            M1_t, M2_t, DA_t, DB_t, a_t, b_t,
-            G_init=Gi_t, loss_fun='square_loss',
-            alpha=alpha, gamma=gamma, log=True,
-            numItermax=numItermax, verbose=verbose,
-            use_gpu=use_gpu, numItermaxEmd=500_000
-        )
-        pi_k = nx.to_numpy(pi_k)
-
-        # ── Strip dummy row/col, compute birth/death mass ──
-        if has_ds:
-            birth_k = float(pi_k[n_sk, :n_tk].sum())
-        else:
-            birth_k = 0.0
-
-        if has_dt:
-            death_k = float(pi_k[:n_sk, n_tk].sum())
-        else:
-            death_k = 0.0
-
-        # Extract real-to-real block
-        pi_k_real = pi_k[:n_sk, :n_tk]
-
-        # Renormalize so this type's sub-plan sums to 1
-        pk_sum = pi_k_real.sum()
-        if pk_sum > 0:
-            pi_k_real = pi_k_real / pk_sum
-
-        # ── Place into global pi with source-fraction weighting ──
-        # Weight = fraction of all source cells in this type
-        # This ensures: Σ_i pi_global[i, :] ≈ 1/ns for each source cell
-        weight_k = float(n_sk) / ns
-        pi_global[np.ix_(S_k, T_k)] = weight_k * pi_k_real
-
-        logFile.write(f"[{k}] src={n_sk}, tgt={n_tk}, budget={budget_k}, "
-                      f"birth={birth_k:.6f}, death={death_k:.6f}, "
-                      f"real_mass={pk_sum:.6f}, weight={weight_k:.4f}\n")
-        print(f"  [{k_idx+1}/{K}] {k}: {n_sk}→{n_tk} "
-              f"(budget={budget_k}) birth={birth_k:.4f} death={death_k:.4f}")
-
-    # ─── 4. Global renormalization ────────────────────────────────────
-    # pi_global.sum() should already ≈ 1.0 (= Σ_k n_sk/ns = ns/ns)
-    # but renormalize to handle edge cases (types with 0 cells on one side)
-    pi_sum = pi_global.sum()
-    if pi_sum > 0 and abs(pi_sum - 1.0) > 1e-10:
-        logFile.write(f"\n[assembly] pi_global.sum()={pi_sum:.8f}, renormalizing to 1.0\n")
-        pi_global = pi_global / pi_sum
-
-    print(f"\n[STRATIFIED] Assembled π: shape={pi_global.shape}, sum={pi_global.sum():.8f}")
-
-    # ─── 5. Final objectives ──────────────────────────────────────────
-    final_obj_neighbor = float(np.sum(neighbor_dist_full * pi_global))
-    final_obj_gene = float(np.sum(cosine_dist_gene * pi_global))
-
-    neighbor_impr = 100.0 * (initial_obj_neighbor - final_obj_neighbor) / initial_obj_neighbor
-    gene_impr = 100.0 * (initial_obj_gene - final_obj_gene) / initial_obj_gene
-
-    logFile.write(f"\nFinal objective neighbor ({neighborhood_dissimilarity}): {final_obj_neighbor}\n")
-    logFile.write(f"Final objective gene (cosine): {final_obj_gene}\n")
-    logFile.write(f"JSD improvement: {neighbor_impr:.4f}%\n")
-    logFile.write(f"Gene improvement: {gene_impr:.4f}%\n")
-    logFile.write(f"Runtime: {time.time() - start_time:.2f} seconds\n")
-    logFile.close()
-
-    print(f"[STRATIFIED] JSD: {initial_obj_neighbor:.6f} → {final_obj_neighbor:.6f} "
-          f"({neighbor_impr:.2f}% improvement)")
-    print(f"[STRATIFIED] Gene: {initial_obj_gene:.6f} → {final_obj_gene:.6f} "
-          f"({gene_impr:.2f}% improvement)")
-    print(f"[STRATIFIED] Runtime: {time.time() - start_time:.1f}s")
-
-    if isinstance(backend, ot.backend.TorchBackend) and use_gpu:
-        torch.cuda.empty_cache()
-
-    if return_obj:
-        return pi_global, initial_obj_neighbor, initial_obj_gene, final_obj_neighbor, final_obj_gene
-
-    return pi_global
 
 
 def neighborhood_distribution(curr_slice, radius):
@@ -1038,71 +605,40 @@ def neighborhood_distribution(curr_slice, radius):
     return np.array(cells_within_radius)
 
 
-def cosine_distance(
-    sliceA,
-    sliceB,
-    sliceA_name,
-    sliceB_name,
-    filePath,
-    use_rep=None,
-    use_gpu=False,
-    nx=ot.backend.NumpyBackend(),
-    overwrite=False,
-):
-    """
-    Compute cosine distance between gene expression matrices of two slices.
-
-    Backend-safe (NumPy / Torch), GPU-safe, and cache-enabled.
-    """
-
-    import os
-    import numpy as np
+def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = None, use_gpu = False, nx = ot.backend.NumpyBackend(), beta = 0.8, overwrite = False):
     from sklearn.metrics.pairwise import cosine_distances
+    import os
 
-    # ─────────────────────────────────────────────
-    # Extract expression matrices
-    # ─────────────────────────────────────────────
-    A_X = extract_data_matrix(sliceA, use_rep)
-    B_X = extract_data_matrix(sliceB, use_rep)
+    A_X, B_X = nx.from_numpy(to_dense_array(extract_data_matrix(sliceA,use_rep))), nx.from_numpy(to_dense_array(extract_data_matrix(sliceB,use_rep)))
 
-    A_X = nx.from_numpy(to_dense_array(A_X))
-    B_X = nx.from_numpy(to_dense_array(B_X))
-
-    # Move to GPU if TorchBackend and requested
-    if isinstance(nx, ot.backend.TorchBackend) and use_gpu:
+    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
         A_X = A_X.cuda()
         B_X = B_X.cuda()
 
-    # Small stability constant
+   
     s_A = A_X + 0.01
     s_B = B_X + 0.01
 
-    # ─────────────────────────────────────────────
-    # File cache
-    # ─────────────────────────────────────────────
-    os.makedirs(filePath, exist_ok=True)
     fileName = f"{filePath}/cosine_dist_gene_expr_{sliceA_name}_{sliceB_name}.npy"
-
+    
     if os.path.exists(fileName) and not overwrite:
-        print("Loading precomputed cosine distance (gene expression)")
-        return np.load(fileName)
+        print("Loading precomputed Cosine distance of gene expression for slice A and slice B")
+        cosine_dist_gene_expr = np.load(fileName)
+    else:
+        print("Calculating cosine dist of gene expression for slice A and slice B")
 
-    print("Computing cosine distance (gene expression)")
+        # calculate cosine distance manually
+        # cosine_dist_gene_expr = 1 - (s_A @ s_B.T) / s_A.norm(dim=1)[:, None] / s_B.norm(dim=1)[None, :]
+        # cosine_dist_gene_expr = cosine_dist_gene_expr.cpu().detach().numpy()
 
-    # ─────────────────────────────────────────────
-    # Convert safely to NumPy (backend aware)
-    # ─────────────────────────────────────────────
-    s_A_np = nx.to_numpy(s_A)
-    s_B_np = nx.to_numpy(s_B)
+        # use sklearn's cosine_distances
+        if torch.cuda.is_available():
+            s_A = s_A.cpu().detach().numpy()
+            s_B = s_B.cpu().detach().numpy()
+        cosine_dist_gene_expr = cosine_distances(s_A, s_B)
 
-    # ─────────────────────────────────────────────
-    # Compute cosine distance
-    # ─────────────────────────────────────────────
-    cosine_dist_gene_expr = cosine_distances(s_A_np, s_B_np)
-
-    # Save
-    np.save(fileName, cosine_dist_gene_expr)
-    print("Saved cosine distance matrix")
+        print("Saving cosine dist of gene expression for slice A and slice B")
+        np.save(fileName, cosine_dist_gene_expr)
 
     return cosine_dist_gene_expr
 
