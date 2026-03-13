@@ -16,7 +16,7 @@ class AlignmentConfig:
                  w_gene: float = 1.0, 
                  w_neighbor: float = 0.5,
                  min_mass_fraction: float = 0.05,
-                 silhouette_threshold: float = 0.45):
+                 silhouette_threshold: float = 0.35):
         self.w_gene = w_gene
         self.w_neighbor = w_neighbor
         self.min_mass_fraction = min_mass_fraction
@@ -52,22 +52,26 @@ def validate_strictly_structural_portions(labels: np.ndarray, min_mass_fraction:
 def align_coordinates_rigid(coords_A, coords_B, allow_reflection=False):
     """
     Finds optimal rigid transformation (rotation & translation) to functionally 
-    align a sub-geometry over a broader geometric space. Returns transformed A.
+    align a sub-geometry over a broader geometric space. Returns centered and aligned A, 
+    along with centered B.
     Uses Orthogonal Procrustes via SVD to capture the tech's slide rotations.
     """
     # 1. Standardize by shifting both to origin solely to compute the rotation matrix
-    A_c = coords_A - coords_A.mean(axis=0)
-    B_c = coords_B - coords_B.mean(axis=0)
+    mean_A = coords_A.mean(axis=0)
+    mean_B = coords_B.mean(axis=0)
     
-    # Scale normalization
+    A_c = coords_A - mean_A
+    B_c = coords_B - mean_B
+    
+    # Scale normalization for SVD math stability
     norm_A = np.linalg.norm(A_c) or 1
     norm_B = np.linalg.norm(B_c) or 1
-    A_c = A_c / norm_A
-    B_c = B_c / norm_B
+    A_c_norm = A_c / norm_A
+    B_c_norm = B_c / norm_B
     
     # 2. SVD to find optimal rotation angle that maps A onto B
     try:
-        U, _, Vt = np.linalg.svd(A_c.T @ B_c)
+        U, _, Vt = np.linalg.svd(A_c_norm.T @ B_c_norm)
         R = (U @ Vt).T
         
         # Enforce exactly rotation (No mirror flipping the tissue) unless intended
@@ -75,11 +79,12 @@ def align_coordinates_rigid(coords_A, coords_B, allow_reflection=False):
             Vt[-1, :] *= -1
             R = (U @ Vt).T
             
-        A_rotated = coords_A @ R.T
-        return A_rotated
+        # 3. Apply the rotation to the *centered* coordinates
+        A_aligned_centered = A_c @ R.T
+        return A_aligned_centered, B_c
     except Exception:
-        # If SVD fails due to extreme mathematical degradation, just return original
-        return coords_A
+        # If SVD fails due to extreme mathematical degradation, return centered original
+        return A_c, B_c
 
 def get_hausdorff_disparity(coords_A, coords_B):
     """
@@ -87,26 +92,26 @@ def get_hausdorff_disparity(coords_A, coords_B):
     Validates structural similarity across rotations utilizing absolute biological dimensions.
     """
     # Downsample if too large to ensure high performance
-    np.random.seed(42) # Ensure reproducible deterministic geometric scores
+    rng = np.random.RandomState(42) # Ensure reproducible deterministic geometric scores
     
     if len(coords_A) > 1500:
-        idx_A = np.random.choice(len(coords_A), 1500, replace=False)
+        idx_A = rng.choice(len(coords_A), 1500, replace=False)
         cA = coords_A[idx_A]
     else:
         cA = coords_A
         
     if len(coords_B) > 1500:
-        idx_B = np.random.choice(len(coords_B), 1500, replace=False)
+        idx_B = rng.choice(len(coords_B), 1500, replace=False)
         cB = coords_B[idx_B]
     else:
         cB = coords_B
         
-    # Rotate slice A to best match slice B's slicing angle before taking distance
-    cA_aligned = align_coordinates_rigid(cA, cB)
+    # Rotate centered slice A to best match centered slice B's slicing angle before taking distance
+    cA_aligned, cB_centered = align_coordinates_rigid(cA, cB)
     
     # Directed Hausdorff is not perfectly symmetric, so we calculate the max of both directions
-    d1 = directed_hausdorff(cA_aligned, cB)[0]
-    d2 = directed_hausdorff(cB, cA_aligned)[0]
+    d1 = directed_hausdorff(cA_aligned, cB_centered)[0]
+    d2 = directed_hausdorff(cB_centered, cA_aligned)[0]
     return max(d1, d2)
 
 def find_spatial_portions(adata: anndata.AnnData, config: AlignmentConfig, max_portions: int = 4) -> tuple[int, np.ndarray]:
@@ -191,14 +196,11 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
             
             surv_A, surv_B_sub = get_surviving_indices(sliceA, sliceB_sub)
             
-            kwargs['sliceB_name'] = kwargs.get('sliceB_name', 'B') + f"_parts{combo}"
-            res = pairwise_align(sliceA, sliceB_sub, **kwargs)
+            iter_kwargs = kwargs.copy()
+            iter_kwargs['sliceB_name'] = iter_kwargs.get('sliceB_name', 'B') + f"_parts{combo}"
+            res = pairwise_align(sliceA, sliceB_sub, **iter_kwargs)
             
             # Combine Gene Cost + Neighborhood Dist -> Robust Score
-            
-            
-            
-            
             cost = config.calculate_cost(res[4], res[3])
             
             if cost < best_cost:
@@ -243,14 +245,11 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
             
             surv_A_sub, surv_B = get_surviving_indices(sliceA_sub, sliceB)
             
-            kwargs['sliceA_name'] = kwargs.get('sliceA_name', 'A') + f"_parts{combo}"
-            res = pairwise_align(sliceA_sub, sliceB, **kwargs)
+            iter_kwargs = kwargs.copy()
+            iter_kwargs['sliceA_name'] = iter_kwargs.get('sliceA_name', 'A') + f"_parts{combo}"
+            res = pairwise_align(sliceA_sub, sliceB, **iter_kwargs)
             
             # Combine Gene Cost + Neighborhood Dist -> Robust Score
-            
-            
-            
-            
             cost = config.calculate_cost(res[4], res[3])
             
             if cost < best_cost:
