@@ -68,8 +68,8 @@ def smart_pairwise_align(sliceA, sliceB, **kwargs):
         
         print(f"[Smart Align] Chose Hemisphere {'0' if cost_0 < cost_1 else '1'} of Slice B (Cost: {min(cost_0, cost_1):.4f})")
         
-        # Reconstruct full Pi matrix
-        full_pi = np.zeros((sliceA.shape[0], sliceB.shape[0]))
+        # Reconstruct full Pi matrix - use best_pi dimensions implicitly filtered by pairwise_align
+        full_pi = np.zeros((best_pi.shape[0], sliceB.shape[0]))
         full_pi[:, winning_idx] = best_pi
         
         best_res_list = list(best_res)
@@ -101,8 +101,8 @@ def smart_pairwise_align(sliceA, sliceB, **kwargs):
         
         print(f"[Smart Align] Chose Hemisphere {'0' if cost_0 < cost_1 else '1'} of Slice A (Cost: {min(cost_0, cost_1):.4f})")
         
-        # Reconstruct full Pi matrix
-        full_pi = np.zeros((sliceA.shape[0], sliceB.shape[0]))
+        # Reconstruct full Pi matrix - use best_pi dimensions implicitly filtered by pairwise_align
+        full_pi = np.zeros((sliceA.shape[0], best_pi.shape[1]))
         full_pi[winning_idx, :] = best_pi
         
         best_res_list = list(best_res)
