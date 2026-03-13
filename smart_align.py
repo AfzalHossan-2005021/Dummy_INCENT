@@ -1,24 +1,25 @@
 import numpy as np
 import anndata
-from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
-from incent.INCENT import pairwise_align
+from .INCENT import pairwise_align
 
-def is_dual_hemisphere(adata: anndata.AnnData, silhouette_threshold: float = 0.5) -> tuple[bool, np.ndarray]:
+def is_dual_hemisphere(adata: anndata.AnnData, silhouette_threshold: float = 0.40) -> tuple[bool, np.ndarray]:
     """
     Detects if a slice contains both hemispheres based on spatial coordinates.
     Returns a boolean and the cluster labels if True.
     """
     coords = adata.obsm['spatial']
     
-    # Try to find 2 clusters
-    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(coords)
+    # Gaussian Mixture Models handle unequal cluster sizes and non-spherical shapes better than KMeans
+    gmm = GaussianMixture(n_components=2, random_state=42, covariance_type='full', n_init=5)
+    labels = gmm.fit_predict(coords)
     
     # Calculate how distinct the two clusters are
     score = silhouette_score(coords, labels)
     
-    # If the score is high, there are two distinct, well-separated spatial blobs (dual hemisphere)
+    # If the score is high, there are two distinct spatial blobs (dual hemisphere)
+    # We lowered the threshold slightly to 0.40 to account for unbalanced tissue sizes and biological noise
     is_dual = score > silhouette_threshold
     
     return is_dual, labels
