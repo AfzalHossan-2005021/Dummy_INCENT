@@ -153,8 +153,11 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
     """
     
     # 1. Detect structures dynamically based on spatial density
-    k_A, labels_A = find_spatial_portions(sliceA)
-    k_B, labels_B = find_spatial_portions(sliceB)
+    if config is None:
+        config = AlignmentConfig()
+        
+    k_A, labels_A = find_spatial_portions(sliceA, config)
+    k_B, labels_B = find_spatial_portions(sliceB, config)
     
     print(f"[Smart Align] Slice A portions: {k_A} | Slice B portions: {k_B}")
     
