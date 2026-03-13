@@ -3,6 +3,7 @@ import pandas as pd
 import anndata
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
+import itertools
 from .INCENT import pairwise_align
 
 def get_surviving_indices(slice1, slice2):
@@ -14,127 +15,118 @@ def get_surviving_indices(slice1, slice2):
     survivors_2 = np.where(slice2.obs['cell_type_annot'].isin(shared_cell_types))[0]
     return survivors_1, survivors_2
 
-def is_dual_hemisphere(adata: anndata.AnnData, silhouette_threshold: float = 0.40) -> tuple[bool, np.ndarray]:
+def find_spatial_portions(adata: anndata.AnnData, max_portions: int = 4, silhouette_threshold: float = 0.35) -> tuple[int, np.ndarray]:
     """
-    Detects if a slice contains both hemispheres based on spatial coordinates.
-    Returns a boolean and the cluster labels if True.
+    Detects the number of physical portions (e.g. 1 vs 2 hemispheres, or 4 for a heart) 
+    based on spatial clustering. Evaluates up to `max_portions`.
     """
     coords = adata.obsm['spatial']
     
-    # Gaussian Mixture Models handle unequal cluster sizes and non-spherical shapes better than KMeans
-    gmm = GaussianMixture(n_components=2, random_state=42, covariance_type='full', n_init=5)
-    labels = gmm.fit_predict(coords)
-    
-    # Calculate how distinct the two clusters are
-    score = silhouette_score(coords, labels)
-    
-    # If the score is high, there are two distinct spatial blobs (dual hemisphere)
-    # We lowered the threshold slightly to 0.40 to account for unbalanced tissue sizes and biological noise
-    is_dual = score > silhouette_threshold
-    
-    return is_dual, labels
+    best_k = 1
+    best_labels = np.zeros(len(coords), dtype=int)
+    best_score = -1
+
+    for k in range(2, max_portions + 1):
+        gmm = GaussianMixture(n_components=k, random_state=42, covariance_type='full', n_init=5)
+        labels = gmm.fit_predict(coords)
+        score = silhouette_score(coords, labels)
+        
+        if score > best_score and score > silhouette_threshold:
+            best_score = score
+            best_k = k
+            best_labels = labels
+            
+    return best_k, best_labels
 
 def smart_pairwise_align(sliceA, sliceB, **kwargs):
     """
-    Automatically detects dual/single hemisphere mismatch and flexibly aligns them.
-    Kwargs are passed directly to INCENT's pairwise_align.
+    Automatically detects varying numbers of structural portions (e.g., matching a 1-portion slice 
+    against a 4-portion heart slice) and perfectly aligns the smaller slice to the correct 
+    geographic subset of the larger slice.
     """
     
-    # 1. Detect structures
-    is_dual_A, labels_A = is_dual_hemisphere(sliceA)
-    is_dual_B, labels_B = is_dual_hemisphere(sliceB)
+    # 1. Detect structures dynamically based on spatial density
+    k_A, labels_A = find_spatial_portions(sliceA)
+    k_B, labels_B = find_spatial_portions(sliceB)
     
-    print(f"[Smart Align] Slice A dual: {is_dual_A} | Slice B dual: {is_dual_B}")
+    print(f"[Smart Align] Slice A portions: {k_A} | Slice B portions: {k_B}")
     
-    # Ensure return_obj is True so we can compare costs
     original_return_obj = kwargs.get('return_obj', False)
     kwargs['return_obj'] = True
     
-    # We will use the 'final_obj_gene' to evaluate the best mapping (index 4 in the returned tuple)
-    
-    # Case 1: Slice A is single, Slice B is dual
-    if not is_dual_A and is_dual_B:
-        print("[Smart Align] Splitting Slice B and finding best hemisphere match...")
-        idx_B0 = np.where(labels_B == 0)[0]
-        idx_B1 = np.where(labels_B == 1)[0]
+    # Case 1: Slice A has fewer portions than Slice B
+    if k_A < k_B:
+        print(f"[Smart Align] Slice A ({k_A} portion) is smaller than Slice B ({k_B} portions). Finding best matching sub-geometry...")
+        best_cost = float('inf')
+        best_res = None
+        best_idx_B = None
         
-        sliceB_0 = sliceB[idx_B0].copy()
-        sliceB_1 = sliceB[idx_B1].copy()
+        # Test all mathematical combinations of K_A portions within Slice B
+        for combo in itertools.combinations(range(k_B), k_A):
+            idx_B_combo = np.where(np.isin(labels_B, combo))[0]
+            sliceB_sub = sliceB[idx_B_combo].copy()
+            
+            surv_A, surv_B_sub = get_surviving_indices(sliceA, sliceB_sub)
+            
+            kwargs['sliceB_name'] = kwargs.get('sliceB_name', 'B') + f"_parts{combo}"
+            res = pairwise_align(sliceA, sliceB_sub, **kwargs)
+            cost = res[4] # using final_obj_gene 
+            
+            if cost < best_cost:
+                best_cost = cost
+                best_res = res
+                best_idx_B = idx_B_combo
         
-        surv_A0, surv_B0_sub = get_surviving_indices(sliceA, sliceB_0)
-        surv_A1, surv_B1_sub = get_surviving_indices(sliceA, sliceB_1)
+        print(f"[Smart Align] Chose Slice B portions mapping to combo (Cost: {best_cost:.4f})")
         
-        # Test mapping to hemisphere 0
-        kwargs['sliceB_name'] = kwargs.get('sliceB_name', 'B') + "_hemi0"
-        res0 = pairwise_align(sliceA, sliceB_0, **kwargs)
-        cost_0 = res0[4] 
-        
-        # Test mapping to hemisphere 1
-        kwargs['sliceB_name'] = kwargs.get('sliceB_name', 'B') + "_hemi1"
-        res1 = pairwise_align(sliceA, sliceB_1, **kwargs)
-        cost_1 = res1[4]
-        
-        # Choose winner
-        best_res = res0 if cost_0 < cost_1 else res1
-        best_pi = best_res[0]
-        
-        print(f"[Smart Align] Chose Hemisphere {'0' if cost_0 < cost_1 else '1'} of Slice B (Cost: {min(cost_0, cost_1):.4f})")
-        
-        # Reconstruct full Pi matrix - completely robust to dropped cell types
+        # Reconstruct full Pi matrix into original global dimensions
+        surv_A_best, surv_B_sub_best = get_surviving_indices(sliceA, sliceB[best_idx_B])
         full_pi = np.zeros((sliceA.shape[0], sliceB.shape[0]))
-        if cost_0 < cost_1:
-            full_pi[np.ix_(surv_A0, idx_B0[surv_B0_sub])] = best_pi
-        else:
-            full_pi[np.ix_(surv_A1, idx_B1[surv_B1_sub])] = best_pi
+        full_pi[np.ix_(surv_A_best, best_idx_B[surv_B_sub_best])] = best_res[0]
         
         best_res_list = list(best_res)
         best_res_list[0] = full_pi
 
-    # Case 2: Slice A is dual, Slice B is single
-    elif is_dual_A and not is_dual_B:
-        print("[Smart Align] Splitting Slice A and finding best hemisphere match...")
-        idx_A0 = np.where(labels_A == 0)[0]
-        idx_A1 = np.where(labels_A == 1)[0]
+    # Case 2: Slice A has more portions than Slice B
+    elif k_A > k_B:
+        print(f"[Smart Align] Slice B ({k_B} portions) is smaller than Slice A ({k_A} portions). Finding best matching sub-geometry...")
+        best_cost = float('inf')
+        best_res = None
+        best_idx_A = None
         
-        sliceA_0 = sliceA[idx_A0].copy()
-        sliceA_1 = sliceA[idx_A1].copy()
+        # Test all mathematical combinations of K_B portions within Slice A
+        for combo in itertools.combinations(range(k_A), k_B):
+            idx_A_combo = np.where(np.isin(labels_A, combo))[0]
+            sliceA_sub = sliceA[idx_A_combo].copy()
+            
+            surv_A_sub, surv_B = get_surviving_indices(sliceA_sub, sliceB)
+            
+            kwargs['sliceA_name'] = kwargs.get('sliceA_name', 'A') + f"_parts{combo}"
+            res = pairwise_align(sliceA_sub, sliceB, **kwargs)
+            cost = res[4] # using final_obj_gene
+            
+            if cost < best_cost:
+                best_cost = cost
+                best_res = res
+                best_idx_A = idx_A_combo
         
-        surv_A0_sub, surv_B0 = get_surviving_indices(sliceA_0, sliceB)
-        surv_A1_sub, surv_B1 = get_surviving_indices(sliceA_1, sliceB)
+        print(f"[Smart Align] Chose Slice A portions mapping to combo (Cost: {best_cost:.4f})")
         
-        # Test mapping to hemisphere 0
-        kwargs['sliceA_name'] = kwargs.get('sliceA_name', 'A') + "_hemi0"
-        res0 = pairwise_align(sliceA_0, sliceB, **kwargs)
-        cost_0 = res0[4] 
-        
-        # Test mapping to hemisphere 1
-        kwargs['sliceA_name'] = kwargs.get('sliceA_name', 'A') + "_hemi1"
-        res1 = pairwise_align(sliceA_1, sliceB, **kwargs)
-        cost_1 = res1[4]
-        
-        # Choose winner
-        best_res = res0 if cost_0 < cost_1 else res1
-        best_pi = best_res[0]
-        
-        print(f"[Smart Align] Chose Hemisphere {'0' if cost_0 < cost_1 else '1'} of Slice A (Cost: {min(cost_0, cost_1):.4f})")
-        
-        # Reconstruct full Pi matrix - completely robust to dropped cell types
+        # Reconstruct full Pi matrix into original global dimensions
+        surv_A_sub_best, surv_B_best = get_surviving_indices(sliceA[best_idx_A], sliceB)
         full_pi = np.zeros((sliceA.shape[0], sliceB.shape[0]))
-        if cost_0 < cost_1:
-            full_pi[np.ix_(idx_A0[surv_A0_sub], surv_B0)] = best_pi
-        else:
-            full_pi[np.ix_(idx_A1[surv_A1_sub], surv_B1)] = best_pi
+        full_pi[np.ix_(best_idx_A[surv_A_sub_best], surv_B_best)] = best_res[0]
         
         best_res_list = list(best_res)
         best_res_list[0] = full_pi
 
-    # Case 3: Both are dual, or both are single
+    # Case 3: Both have the same number of portions
     else:
-        print("[Smart Align] Slices are structurally identical (both single or both dual). Proceeding with standard alignment.")
+        print(f"[Smart Align] Slices are structurally identical ({k_A} vs {k_B} portions). Proceeding with standard alignment.")
         surv_A, surv_B = get_surviving_indices(sliceA, sliceB)
         best_res_list = list(pairwise_align(sliceA, sliceB, **kwargs))
         
-        # Reconstruct full Pi matrix in case standard pairwise_align dropped cells
+        # Protect against cell type drop shape mismatches
         full_pi = np.zeros((sliceA.shape[0], sliceB.shape[0]))
         full_pi[np.ix_(surv_A, surv_B)] = best_res_list[0]
         best_res_list[0] = full_pi
