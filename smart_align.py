@@ -27,14 +27,14 @@ class AlignmentConfig:
         max_candidates: Number of top cluster combinations to evaluate geometrically. 
                         Prevents hardcoded truncation of reasonable geometric candidates.
     """
-    def __init__(self, 
-                 w_gene: float = 1.0, 
+    def __init__(self,
+                 w_gene: float = 1.0,
                  w_neighbor: float = 0.5,
                  min_mass_fraction: float = 0.05,
-                 silhouette_threshold: float = 0.4,
+                 silhouette_threshold: float = 0.1,
                  allow_reflection: bool = False,
                  allow_scale: bool = True,
-                 clustering_method: str = 'hierarchical',
+                 clustering_method: str = 'gmm',
                  max_candidates: int = 3):
         self.w_gene = w_gene
         self.w_neighbor = w_neighbor
@@ -173,7 +173,7 @@ def find_spatial_portions(adata: anndata.AnnData, config: AlignmentConfig, max_p
             # (addresses the GMM "ellipsoidal" failure on complex shapes like crescent cortical layers)
             try:
                 connectivity = kneighbors_graph(coords, n_neighbors=10, include_self=False)
-                model = AgglomerativeClustering(n_components=k, connectivity=connectivity, linkage='ward')
+                model = AgglomerativeClustering(n_clusters=k, connectivity=connectivity, linkage='ward')
                 labels = model.fit_predict(coords)
                 score = silhouette_score(coords, labels)
                 
