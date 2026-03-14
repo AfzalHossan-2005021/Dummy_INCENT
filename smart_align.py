@@ -16,7 +16,7 @@ class AlignmentConfig:
                  w_gene: float = 1.0, 
                  w_neighbor: float = 0.5,
                  min_mass_fraction: float = 0.05,
-                 silhouette_threshold: float = 0.35,
+                 silhouette_threshold: float = 0.4,
                  allow_reflection: bool = False):
         self.w_gene = w_gene
         self.w_neighbor = w_neighbor
