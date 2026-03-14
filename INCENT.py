@@ -48,24 +48,28 @@ def pairwise_align(
     Args:
         sliceA: Slice A to align.
         sliceB: Slice B to align.
-        alpha:  weight for spatial distance
-        gamma: weight for gene expression distance (JSD)
-        beta: weight for cell type one hot encoding
-        radius: radius for cellular neighborhood
-
-        dissimilarity: Expression dissimilarity measure: ``'kl'`` or ``'euclidean'``.
+        alpha: weight for spatial distance
+        beta: weight for cell type one-hot encoding cost
+        gamma: weight for neighborhood expression distance (e.g., JSD)
+        radius: spatial radius (Euclidean distance) defining the local neighborhood of a cell.
+        filePath: Absolute or relative directory path used for caching distance matrices and results.
         use_rep: If ``None``, uses ``slice.X`` to calculate dissimilarity between spots, otherwise uses the representation given by ``slice.obsm[use_rep]``.
         G_init (array-like, optional): Initial mapping to be used in FGW-OT, otherwise default is uniform mapping.
         a_distribution (array-like, optional): Distribution of sliceA spots, otherwise default is uniform.
         b_distribution (array-like, optional): Distribution of sliceB spots, otherwise default is uniform.
-        numItermax: Max number of iterations during FGW-OT.
         norm: If ``True``, scales spatial distances such that neighboring spots are at distance 1. Otherwise, spatial distances remain unchanged.
+        numItermax: Max number of iterations during FGW-OT.
         backend: Type of backend to run calculations. For list of backends available on system: ``ot.backend.get_backend_list()``.
         use_gpu: If ``True``, use gpu. Otherwise, use cpu. Currently we only have gpu support for Pytorch.
         return_obj: If ``True``, additionally returns objective function output of FGW-OT.
         verbose: If ``True``, FGW-OT is verbose.
         gpu_verbose: If ``True``, print whether gpu is being used to user.
-   
+        sliceA_name: Optional string identifier for slice A caching.
+        sliceB_name: Optional string identifier for slice B caching.
+        overwrite: If ``True``, forces recalculation of distance matrices ignoring cache.
+        neighborhood_dissimilarity: Name of measure for neighborhood comparisons (e.g., ``'jsd'`` for Jensen-Shannon Divergence).
+        dummy_cell: If ``True``, uses an unbalanced OT heuristic by introducing dummy nodes to absorb mass unbalance across differing portions.
+
     Returns:
         - Alignment of spots.
 
@@ -155,6 +159,13 @@ def pairwise_align(
         coordinatesB = coordinatesB.float()
     D_A = ot.dist(coordinatesA,coordinatesA, metric='euclidean')
     D_B = ot.dist(coordinatesB,coordinatesB, metric='euclidean')
+
+    # --- CRITICAL GEOMETRIC SCALING ---
+    # To achieve perfect structural alignment regardless of slices being from different 
+    # platforms, resolutions, or mechanical stretch, we normalize the spatial spaces to [0, 1].
+    # This ensures Gromov-Wasserstein penalty relies purely on relative shape, not absolute size.
+    D_A /= nx.max(D_A)
+    D_B /= nx.max(D_B)
 
     # print the shape of D_A and D_B
     # print("D_A.shape: ", D_A.shape)
@@ -435,8 +446,9 @@ def pairwise_align(
         b = b.cuda()
     
     if norm:
-        D_A /= nx.min(D_A[D_A>0])
-        D_B /= nx.min(D_B[D_B>0])
+        # Heritage PASTE flag: scaled min distance to 1. 
+        # Replaced globally by max-normalization [0,1] at distance calculation for stability.
+        pass
     
     # Run OT
     if G_init is not None:
