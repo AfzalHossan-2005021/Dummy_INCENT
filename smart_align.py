@@ -3,7 +3,7 @@ import pandas as pd
 import anndata
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
-from scipy.spatial.distance import directed_hausdorff
+from scipy.spatial.distance import cdist
 import itertools
 from .INCENT import pairwise_align
 
@@ -16,11 +16,13 @@ class AlignmentConfig:
                  w_gene: float = 1.0, 
                  w_neighbor: float = 0.5,
                  min_mass_fraction: float = 0.05,
-                 silhouette_threshold: float = 0.35):
+                 silhouette_threshold: float = 0.35,
+                 allow_reflection: bool = False):
         self.w_gene = w_gene
         self.w_neighbor = w_neighbor
         self.min_mass_fraction = min_mass_fraction
         self.silhouette_threshold = silhouette_threshold
+        self.allow_reflection = allow_reflection
         
     def calculate_cost(self, final_obj_gene: float, final_obj_neighbor: float) -> float:
         return (self.w_gene * final_obj_gene) + (self.w_neighbor * final_obj_neighbor)
@@ -86,33 +88,42 @@ def align_coordinates_rigid(coords_A, coords_B, allow_reflection=False):
         # If SVD fails due to extreme mathematical degradation, return centered original
         return A_c, B_c
 
-def get_hausdorff_disparity(coords_A, coords_B):
+def get_hausdorff_disparity(coords_A, coords_B, percentile=95, allow_reflection=False):
     """
-    Computes the geometric shape dissimilarity using the directed Hausdorff distance.
-    Validates structural similarity across rotations utilizing absolute biological dimensions.
+    Computes the geometric shape dissimilarity using a Robust Percentile Directed Hausdorff.
+    This effectively ignores stray "floater" cells and experimental debris artifacts 
+    that heavily skew standard maximum distance calculations.
     """
-    # Downsample if too large to ensure high performance
-    rng = np.random.RandomState(42) # Ensure reproducible deterministic geometric scores
+    rng = np.random.RandomState(42)
     
-    if len(coords_A) > 1500:
-        idx_A = rng.choice(len(coords_A), 1500, replace=False)
+    # Safely increased to 3000 since vectorization is highly optimized
+    if len(coords_A) > 3000:
+        idx_A = rng.choice(len(coords_A), 3000, replace=False)
         cA = coords_A[idx_A]
     else:
         cA = coords_A
         
-    if len(coords_B) > 1500:
-        idx_B = rng.choice(len(coords_B), 1500, replace=False)
+    if len(coords_B) > 3000:
+        idx_B = rng.choice(len(coords_B), 3000, replace=False)
         cB = coords_B[idx_B]
     else:
         cB = coords_B
         
-    # Rotate centered slice A to best match centered slice B's slicing angle before taking distance
-    cA_aligned, cB_centered = align_coordinates_rigid(cA, cB)
+    # Standardize & Rotate
+    cA_aligned, cB_centered = align_coordinates_rigid(cA, cB, allow_reflection=allow_reflection)
     
-    # Directed Hausdorff is not perfectly symmetric, so we calculate the max of both directions
-    d1 = directed_hausdorff(cA_aligned, cB_centered)[0]
-    d2 = directed_hausdorff(cB_centered, cA_aligned)[0]
-    return max(d1, d2)
+    # Calculate pairwise distance matrices
+    dist_matrix = cdist(cA_aligned, cB_centered)
+    
+    # Distance from each point in A to the closest in B, and vice versa
+    dists_A_to_B = np.min(dist_matrix, axis=1)
+    dists_B_to_A = np.min(dist_matrix, axis=0) # cdist(A,B) axis=0 acts as dist B to A
+    
+    # Take the robust 95th percentile instead of the 100th (maximum) to ignore extreme outliers/debris
+    h1 = np.percentile(dists_A_to_B, percentile)
+    h2 = np.percentile(dists_B_to_A, percentile)
+    
+    return max(h1, h2)
 
 def find_spatial_portions(adata: anndata.AnnData, config: AlignmentConfig, max_portions: int = 4) -> tuple[int, np.ndarray]:
     """
@@ -179,7 +190,7 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
             idx_B_combo = np.where(np.isin(labels_B, combo))[0]
             sliceB_sub = sliceB[idx_B_combo]
             
-            disparity = get_hausdorff_disparity(sliceA.obsm['spatial'], sliceB_sub.obsm['spatial'])
+            disparity = get_hausdorff_disparity(sliceA.obsm['spatial'], sliceB_sub.obsm['spatial'], allow_reflection=config.allow_reflection)
             combos_and_disparities.append((combo, idx_B_combo, disparity))
             
         # Sort by geometry disparity and keep top 3 maximum to save compute time
@@ -228,7 +239,7 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
             idx_A_combo = np.where(np.isin(labels_A, combo))[0]
             sliceA_sub = sliceA[idx_A_combo]
             
-            disparity = get_hausdorff_disparity(sliceA_sub.obsm['spatial'], sliceB.obsm['spatial'])
+            disparity = get_hausdorff_disparity(sliceA_sub.obsm['spatial'], sliceB.obsm['spatial'], allow_reflection=config.allow_reflection)
             combos_and_disparities.append((combo, idx_A_combo, disparity))
             
         # Sort by geometry disparity and keep top 3 maximum to save compute time
