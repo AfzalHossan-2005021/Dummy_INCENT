@@ -10,7 +10,6 @@ from tqdm import tqdm
 from anndata import AnnData
 from numpy.typing import NDArray
 from typing import Optional, Tuple, Union
-from sklearn.metrics.pairwise import euclidean_distances
 
 from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
 
@@ -580,29 +579,33 @@ def neighborhood_distribution(curr_slice, radius):
         niche_distribution: Niche distribution for the slice.
     """
 
-    # print ("radius", radius)
-
-    unique_cell_types = np.array(list(curr_slice.obs['cell_type_annot'].unique()))
-    cell_type_to_index = dict(zip(unique_cell_types, list(range(len(unique_cell_types)))))
-    cells_within_radius = np.zeros((curr_slice.shape[0], len(unique_cell_types)), dtype=float)
-
-    # print("time taken for cell type", time_cell_type_end-time_cell_type_start)
-
+    cell_types = np.array(curr_slice.obs['cell_type_annot'].astype(str))
+    unique_cell_types = np.unique(cell_types)
+    cell_type_to_index = {ct: i for i, ct in enumerate(unique_cell_types)}
+    
     source_coords = curr_slice.obsm['spatial']
-    distances = euclidean_distances(source_coords, source_coords)
+    n_cells = curr_slice.shape[0]
+    
+    cells_within_radius = np.zeros((n_cells, len(unique_cell_types)), dtype=float)
 
-    for i in tqdm(range(curr_slice.shape[0])):
-        # find the indices of the cells within the radius
+    # Use BallTree instead of full O(n^2) distance matrix for memory & speed scalability
+    from sklearn.neighbors import BallTree
+    tree = BallTree(source_coords)
+    neighbor_lists = tree.query_radius(source_coords, r=radius)
 
-        target_indices = np.where(distances[i] <= radius)[0]
-        # print("i", i)
-        # print(target_indices)
+    for i in tqdm(range(n_cells), desc="Computing neighborhood distribution"):
+        neighbors = neighbor_lists[i]
+        for ind in neighbors:
+            ct = cell_types[ind]
+            cells_within_radius[i][cell_type_to_index[ct]] += 1
+            
+    # CRITICAL FIX: Normalize to probability distributions before computing JSD
+    row_sums = cells_within_radius.sum(axis=1, keepdims=True)
+    # Avoid division by zero for isolated cells
+    row_sums[row_sums == 0] = 1 
+    cells_within_radius = cells_within_radius / row_sums
 
-        for ind in target_indices:
-            cell_type_str_j = str(curr_slice.obs['cell_type_annot'][ind])
-            cells_within_radius[i][cell_type_to_index[cell_type_str_j]] += 1
-
-    return np.array(cells_within_radius)
+    return cells_within_radius
 
 
 def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = None, use_gpu = False, nx = ot.backend.NumpyBackend(), beta = 0.8, overwrite = False):

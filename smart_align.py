@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import anndata
 from sklearn.mixture import GaussianMixture
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.neighbors import kneighbors_graph
 from sklearn.metrics import silhouette_score
 from scipy.spatial.distance import cdist
 import itertools
@@ -11,18 +13,37 @@ class AlignmentConfig:
     """
     Configuration parameters for spatial alignment.
     Allows user-defined biological priors rather than hardcoded heuristics.
+    
+    Attributes:
+        w_gene: Weight of the gene expression cost in the final candidate scoring.
+        w_neighbor: Weight of the neighborhood spatial cost in final scoring.
+        min_mass_fraction: Minimum proportion of total cells required for a cluster 
+                           to be considered a macro-structure rather than debris.
+        silhouette_threshold: Minimum ratio of intra-cluster to inter-cluster distance 
+                              required to consider a tissue fragment anatomically disjoint.
+        allow_reflection: If true, allows Z-axis mirror reflections in rigid alignment.
+        allow_scale: If true, uses Generalized Procrustes Analysis for scale normalization.
+        clustering_method: Either 'hierarchical' (continuous) or 'gmm' (ellipsoidal).
+        max_candidates: Number of top cluster combinations to evaluate geometrically. 
+                        Prevents hardcoded truncation of reasonable geometric candidates.
     """
     def __init__(self, 
                  w_gene: float = 1.0, 
                  w_neighbor: float = 0.5,
                  min_mass_fraction: float = 0.05,
                  silhouette_threshold: float = 0.4,
-                 allow_reflection: bool = False):
+                 allow_reflection: bool = False,
+                 allow_scale: bool = True,
+                 clustering_method: str = 'hierarchical',
+                 max_candidates: int = 3):
         self.w_gene = w_gene
         self.w_neighbor = w_neighbor
         self.min_mass_fraction = min_mass_fraction
         self.silhouette_threshold = silhouette_threshold
         self.allow_reflection = allow_reflection
+        self.allow_scale = allow_scale
+        self.clustering_method = clustering_method
+        self.max_candidates = max_candidates
         
     def calculate_cost(self, final_obj_gene: float, final_obj_neighbor: float) -> float:
         return (self.w_gene * final_obj_gene) + (self.w_neighbor * final_obj_neighbor)
@@ -51,12 +72,12 @@ def validate_strictly_structural_portions(labels: np.ndarray, min_mass_fraction:
             
     return True
 
-def align_coordinates_rigid(coords_A, coords_B, allow_reflection=False):
+def align_coordinates(coords_A, coords_B, allow_reflection=False, allow_scale=True):
     """
-    Finds optimal rigid transformation (rotation & translation) to functionally 
+    Finds optimal rigid transformation (rotation, translation, & scale) to functionally 
     align a sub-geometry over a broader geometric space. Returns centered and aligned A, 
     along with centered B.
-    Uses Orthogonal Procrustes via SVD to capture the tech's slide rotations.
+    Uses Generalized Procrustes Analysis via SVD to capture the tech's slide rotations.
     """
     # 1. Standardize by shifting both to origin solely to compute the rotation matrix
     mean_A = coords_A.mean(axis=0)
@@ -73,7 +94,7 @@ def align_coordinates_rigid(coords_A, coords_B, allow_reflection=False):
     
     # 2. SVD to find optimal rotation angle that maps A onto B
     try:
-        U, _, Vt = np.linalg.svd(A_c_norm.T @ B_c_norm)
+        U, D, Vt = np.linalg.svd(A_c_norm.T @ B_c_norm)
         R = (U @ Vt).T
         
         # Enforce exactly rotation (No mirror flipping the tissue) unless intended
@@ -81,14 +102,21 @@ def align_coordinates_rigid(coords_A, coords_B, allow_reflection=False):
             Vt[-1, :] *= -1
             R = (U @ Vt).T
             
-        # 3. Apply the rotation to the *centered* coordinates
-        A_aligned_centered = A_c @ R.T
+        # Compute optimal scaling factor
+        if allow_scale:
+            # Optimal scale s = trace(R^T A^T B) / trace(A^T A)
+            scale = np.trace(R.T @ A_c.T @ B_c) / np.trace(A_c.T @ A_c)
+        else:
+            scale = 1.0
+            
+        # 3. Apply the rotation and scaling to the *centered* coordinates
+        A_aligned_centered = (A_c @ R.T) * scale
         return A_aligned_centered, B_c
     except Exception:
         # If SVD fails due to extreme mathematical degradation, return centered original
         return A_c, B_c
 
-def get_hausdorff_disparity(coords_A, coords_B, percentile=95, allow_reflection=False):
+def get_hausdorff_disparity(coords_A, coords_B, percentile=95, allow_reflection=False, allow_scale=True):
     """
     Computes the geometric shape dissimilarity using a Robust Percentile Directed Hausdorff.
     This effectively ignores stray "floater" cells and experimental debris artifacts 
@@ -110,7 +138,7 @@ def get_hausdorff_disparity(coords_A, coords_B, percentile=95, allow_reflection=
         cB = coords_B
         
     # Standardize & Rotate
-    cA_aligned, cB_centered = align_coordinates_rigid(cA, cB, allow_reflection=allow_reflection)
+    cA_aligned, cB_centered = align_coordinates(cA, cB, allow_reflection=allow_reflection, allow_scale=allow_scale)
     
     # Calculate pairwise distance matrices
     dist_matrix = cdist(cA_aligned, cB_centered)
@@ -140,18 +168,34 @@ def find_spatial_portions(adata: anndata.AnnData, config: AlignmentConfig, max_p
         scores = []
         label_inits = []
         
-        # Multi-seed stability check to prevent declaring debris as a vital organ portion
-        for seed in range(5):
-            gmm = GaussianMixture(n_components=k, random_state=seed, covariance_type='full', n_init=3)
-            labels = gmm.fit_predict(coords)
-            score = silhouette_score(coords, labels)
-            
-            if score > config.silhouette_threshold and validate_strictly_structural_portions(labels, config.min_mass_fraction):
-                scores.append(score)
-                label_inits.append(labels)
+        if getattr(config, 'clustering_method', 'gmm') == 'hierarchical':
+            # Use spatial connectivity graph to ensure continuous anatomical regions 
+            # (addresses the GMM "ellipsoidal" failure on complex shapes like crescent cortical layers)
+            try:
+                connectivity = kneighbors_graph(coords, n_neighbors=10, include_self=False)
+                model = AgglomerativeClustering(n_components=k, connectivity=connectivity, linkage='ward')
+                labels = model.fit_predict(coords)
+                score = silhouette_score(coords, labels)
                 
-        # Must successfully detect same macroscopic clustering across majority of random seeds
-        if len(scores) >= 3:
+                if score > config.silhouette_threshold and validate_strictly_structural_portions(labels, config.min_mass_fraction):
+                    scores.append(score)
+                    label_inits.append(labels)
+            except Exception:
+                pass
+        else:
+            # GMM multi-seed stability check
+            for seed in range(5):
+                gmm = GaussianMixture(n_components=k, random_state=seed, covariance_type='full', n_init=3)
+                labels = gmm.fit_predict(coords)
+                score = silhouette_score(coords, labels)
+                
+                if score > config.silhouette_threshold and validate_strictly_structural_portions(labels, config.min_mass_fraction):
+                    scores.append(score)
+                    label_inits.append(labels)
+                    
+        # Must successfully detect same macroscopic clustering across required valid runs
+        required_stable_runs = 1 if getattr(config, 'clustering_method', 'gmm') == 'hierarchical' else 3
+        if len(scores) >= required_stable_runs:
             avg_score = np.mean(scores)
             if avg_score > best_score:
                 best_score = avg_score
@@ -190,12 +234,17 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
             idx_B_combo = np.where(np.isin(labels_B, combo))[0]
             sliceB_sub = sliceB[idx_B_combo]
             
-            disparity = get_hausdorff_disparity(sliceA.obsm['spatial'], sliceB_sub.obsm['spatial'], allow_reflection=config.allow_reflection)
+            disparity = get_hausdorff_disparity(
+                sliceA.obsm['spatial'], 
+                sliceB_sub.obsm['spatial'], 
+                allow_reflection=getattr(config, 'allow_reflection', False),
+                allow_scale=getattr(config, 'allow_scale', True)
+            )
             combos_and_disparities.append((combo, idx_B_combo, disparity))
             
-        # Sort by geometry disparity and keep top 3 maximum to save compute time
+        # Sort by geometry disparity and keep top N maximum to save compute time
         combos_and_disparities.sort(key=lambda x: x[2])
-        top_combos = combos_and_disparities[:3]
+        top_combos = combos_and_disparities[:config.max_candidates]
         
         best_cost = float('inf')
         best_res = None
@@ -204,8 +253,6 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
         # 2. Run Heavy INCENT alignment on the top geometric candidates
         for combo, idx_B_combo, _ in top_combos:
             sliceB_sub = sliceB[idx_B_combo].copy()
-            
-            surv_A, surv_B_sub = get_surviving_indices(sliceA, sliceB_sub)
             
             iter_kwargs = kwargs.copy()
             iter_kwargs['sliceB_name'] = iter_kwargs.get('sliceB_name', 'B') + f"_parts{combo}"
@@ -239,12 +286,17 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
             idx_A_combo = np.where(np.isin(labels_A, combo))[0]
             sliceA_sub = sliceA[idx_A_combo]
             
-            disparity = get_hausdorff_disparity(sliceA_sub.obsm['spatial'], sliceB.obsm['spatial'], allow_reflection=config.allow_reflection)
+            disparity = get_hausdorff_disparity(
+                sliceA_sub.obsm['spatial'], 
+                sliceB.obsm['spatial'], 
+                allow_reflection=getattr(config, 'allow_reflection', False),
+                allow_scale=getattr(config, 'allow_scale', True)
+            )
             combos_and_disparities.append((combo, idx_A_combo, disparity))
             
-        # Sort by geometry disparity and keep top 3 maximum to save compute time
+        # Sort by geometry disparity and keep top N maximum to save compute time
         combos_and_disparities.sort(key=lambda x: x[2])
-        top_combos = combos_and_disparities[:3]
+        top_combos = combos_and_disparities[:config.max_candidates]
         
         best_cost = float('inf')
         best_res = None
@@ -253,8 +305,6 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
         # 2. Run Heavy INCENT alignment on the top geometric candidates
         for combo, idx_A_combo, _ in top_combos:
             sliceA_sub = sliceA[idx_A_combo].copy()
-            
-            surv_A_sub, surv_B = get_surviving_indices(sliceA_sub, sliceB)
             
             iter_kwargs = kwargs.copy()
             iter_kwargs['sliceA_name'] = iter_kwargs.get('sliceA_name', 'A') + f"_parts{combo}"
@@ -280,7 +330,15 @@ def smart_pairwise_align(sliceA, sliceB, config: AlignmentConfig = None, **kwarg
 
     # Case 3: Both have the same number of portions
     else:
-        print(f"[Smart Align] Slices are structurally identical ({k_A} vs {k_B} portions). Proceeding with standard alignment.")
+        print(f"[Smart Align] Slices have identical number of portions ({k_A} vs {k_B}). Checking shape disparity...")
+        disparity = get_hausdorff_disparity(
+            sliceA.obsm['spatial'], 
+            sliceB.obsm['spatial'], 
+            allow_reflection=getattr(config, 'allow_reflection', False),
+            allow_scale=getattr(config, 'allow_scale', True)
+        )
+        print(f"[Smart Align] Full slice structural geometric disparity: {disparity:.4f}. Proceeding with standard alignment.")
+        
         surv_A, surv_B = get_surviving_indices(sliceA, sliceB)
         best_res_list = list(pairwise_align(sliceA, sliceB, **kwargs))
         

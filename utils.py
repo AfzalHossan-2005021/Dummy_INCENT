@@ -60,7 +60,12 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
             G0 = G0.cuda()
 
     def f(G):
-   
+        """
+        Computes the structure-matching spatial penalty (Gromov-Wasserstein loss).
+        NOTE: This utilizes the inner-product (square-loss variant) <C1, GG^T> + <C2, G^TG>
+        rather than the conventional norm expansion ||c1(x,x') - c2(y,y')||^2 used in base POT.
+        This provides improved alignment dynamics when dealing with unnormalized geometries.
+        """
         # print("G.shape: ", G.shape)
         # print("C1.shape: ", C1.shape)
         # print("C2.shape: ", C2.shape)
@@ -70,7 +75,9 @@ def fused_gromov_wasserstein_incent(M1, M2, C1, C2, p, q, gamma, G_init = None, 
         return nx.sum((G @ G.T)  * C1) + nx.sum((G.T @ G)  * C2)
 
     def df(G):
-        # Gradient of f(G)=<C1, GG^T> + <C2, G^T G> is 2*(C1G + GC2)
+        """
+        Gradient of the square-loss GW variant.
+        """
         return 2 * (nx.dot(C1, G) + nx.dot(G, C2))
     
     # armijo is default to False and loss_fun is default to square_loss
